@@ -35,3 +35,7 @@ class Base(unittest.TestCase):
 class TestScaffold(unittest.TestCase):
     def test_scaffold(self):
         self.assertTrue(os.path.isdir(cache_tool.PROGRAM_DIR))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
