@@ -20,6 +20,7 @@ Non-interactive (for scripting):
 """
 import os
 import sys
+import hashlib
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROGRAM_DIR)
