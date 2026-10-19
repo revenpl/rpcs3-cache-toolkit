@@ -106,5 +106,74 @@ class TestRaw(Base):
         self.assertGreater(len({x["sha256"] for x in cache_tool.scan_raw(gowa["sc"])}), 1)
 
 
+class TestRscaHelpers(Base):
+    def _ppu_with_entries(self):
+        trees = [t for t in cache_tool.find_shader_caches(self.data) if t["entries"] > 0]
+        return max(trees, key=lambda t: t["entries"])["ppu_dir"]
+
+    def _make_rsca(self, out):
+        import types
+        opt_cache = cache_tool.opt_cache
+        opt_cache.cmd_pack(types.SimpleNamespace(
+            cache=self._ppu_with_entries(), out=out, game_id="BCES01741", mode="byte-exact"))
+        return out
+
+    def test_read_rsca_game_id(self):
+        out = self._make_rsca(os.path.join(self.tmp, "BCES01741.rsca"))
+        self.assertEqual(cache_tool.read_rsca_game_id(out), "BCES01741")
+
+    def test_read_rsca_game_id_rejects_non_rsca(self):
+        p = os.path.join(self.tmp, "junk.rsca")
+        with open(p, "wb") as f:
+            f.write(b"NOT-RSCA-JUNK-DATA-12345678901")
+        with self.assertRaises(ValueError):
+            cache_tool.read_rsca_game_id(p)
+
+    def test_list_rsca_files(self):
+        with open(os.path.join(self.tmp, "ABC12345.rsca"), "w") as f:
+            f.write("x")
+        with open(os.path.join(self.tmp, "notrsca.txt"), "w") as f:
+            f.write("x")
+        self.assertEqual(cache_tool.list_rsca_files(self.tmp), ["ABC12345.rsca"])
+
+    def test_pick_ppu_dir(self):
+        ppu = cache_tool.pick_ppu_dir(self.data, "BCES01741")
+        self.assertTrue(ppu.startswith(os.path.join(self.data, "cache", "BCES01741")))
+        self.assertTrue(os.path.basename(ppu).startswith("ppu-"))
+        self.assertIsNone(cache_tool.pick_ppu_dir(self.data, "NOPE123"))
+
+    def test_import_merges_into_existing_ppu_dir(self):
+        rsca = self._make_rsca(os.path.join(self.tmp, "BCES01741.rsca"))
+        dst = os.path.join(self.tmp, "dst")
+        ppu_name = "ppu-TARGET-GOWA.SELF"  # deliberately different name = other machine
+        os.makedirs(os.path.join(dst, "cache", "BCES01741", ppu_name), exist_ok=True)
+        target = cache_tool.do_import(rsca, dst)
+        self.assertEqual(target, os.path.join(dst, "cache", "BCES01741", ppu_name))
+        sc = os.path.join(target, "shaders_cache")
+        bins = sum(len([f for f in fs if f.endswith(".bin")])
+                   for _r, _d, fs in os.walk(os.path.join(sc, "pipelines")))
+        raws = len([f for f in os.listdir(os.path.join(sc, "raw")) if f.endswith((".vp", ".fp"))])
+        self.assertEqual(bins, 50)
+        self.assertEqual(raws, 98)
+
+    def test_import_twice_is_idempotent(self):
+        rsca = self._make_rsca(os.path.join(self.tmp, "BCES01741.rsca"))
+        dst = os.path.join(self.tmp, "dst")
+        ppu_name = "ppu-TARGET-GOWA.SELF"
+        os.makedirs(os.path.join(dst, "cache", "BCES01741", ppu_name), exist_ok=True)
+        cache_tool.do_import(rsca, dst)
+        cache_tool.do_import(rsca, dst)
+        sc = os.path.join(dst, "cache", "BCES01741", ppu_name, "shaders_cache")
+        raws = len([f for f in os.listdir(os.path.join(sc, "raw")) if f.endswith((".vp", ".fp"))])
+        self.assertEqual(raws, 98)
+
+    def test_import_without_game_dir_raises(self):
+        rsca = self._make_rsca(os.path.join(self.tmp, "BCES01741.rsca"))
+        bare = os.path.join(self.tmp, "bare")
+        os.makedirs(bare)
+        with self.assertRaises(FileNotFoundError):
+            cache_tool.do_import(rsca, bare)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

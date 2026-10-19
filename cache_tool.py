@@ -21,6 +21,7 @@ Non-interactive (for scripting):
 import os
 import sys
 import hashlib
+import types
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROGRAM_DIR)
@@ -168,3 +169,50 @@ def scan_raw(sc):
         if os.path.isfile(p):
             raws.append({"path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)})
     return raws
+
+
+def list_rsca_files(program_dir):
+    if not os.path.isdir(program_dir):
+        return []
+    return sorted(f for f in os.listdir(program_dir) if f.lower().endswith(".rsca"))
+
+
+def read_rsca_game_id(path):
+    """Game id from the RSCA v1 header (bytes 8..23) — no full parse needed."""
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if len(head) < 24 or head[:4] != opt_cache.MAGIC:
+        raise ValueError(f"not an RSCA file: {path}")
+    return head[8:24].rstrip(b"\x00").decode()
+
+
+def pick_ppu_dir(data_dir, game_id):
+    """First ppu-* dir (sorted) under <data_dir>/cache/<game_id>/ (case-insensitive
+    game match), or None. The RSCA manifest doesn't carry the ppu name, so import
+    can only target a dir that already exists on this machine."""
+    base = os.path.join(data_dir, "cache")
+    if not os.path.isdir(base):
+        return None
+    for g in sorted(os.listdir(base)):
+        if g.lower() != game_id.lower():
+            continue
+        d = os.path.join(base, g)
+        for sub in sorted(os.listdir(d)):
+            if sub.startswith("ppu-") and os.path.isdir(os.path.join(d, sub)):
+                return os.path.join(d, sub)
+    return None
+
+
+def do_import(rsca_path, data_dir, ppu_dir=None):
+    """Merge .rsca into the local cache (idempotent union). Returns the ppu dir used.
+    Raises FileNotFoundError when the game has no ppu-* dir yet."""
+    game = read_rsca_game_id(rsca_path)
+    if ppu_dir is None:
+        ppu_dir = pick_ppu_dir(data_dir, game)
+        if ppu_dir is None:
+            raise FileNotFoundError(
+                f"no ppu-* cache dir for {game} under {os.path.join(data_dir, 'cache')}\n"
+                f"  -> launch the game once in RPCS3 (it creates the dir), then re-run,\n"
+                f"  or pass --ppu DIR explicitly.")
+    opt_cache.cmd_merge(types.SimpleNamespace(pack=rsca_path, target=ppu_dir, overwrite=False))
+    return ppu_dir
