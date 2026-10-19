@@ -97,3 +97,51 @@ def find_shader_caches(data_dir, max_depth=8):
         else:
             dirnames[:] = [d for d in dirnames if d not in SKIP]
     return sorted(trees, key=lambda t: (t["game_id"], t["ppu_dir"]))
+
+
+def search_hits(root, max_depth=5):
+    """Bounded walk from root. A hit = a dir whose child 'cache/' contains a usable
+    shaders_cache (RPCS3 always stores them under <data>/cache/). Returns
+    [(data_dir, [trees]), ...] in discovery order."""
+    hits = []
+    seen = set()
+    if not os.path.isdir(root):
+        return hits
+    for dirpath, dirnames, _files in os.walk(root, topdown=True):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == os.curdir else rel.count(os.sep) + 1
+        if depth >= max_depth:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in SKIP]
+        if "cache" in dirnames:
+            trees = find_shader_caches(dirpath)
+            if trees:
+                d = os.path.abspath(dirpath)
+                if d not in seen:
+                    seen.add(d)
+                    hits.append((d, trees))
+                dirnames[:] = []  # don't descend further through a confirmed hit
+    return hits
+
+
+def discover(home=None, env=None):
+    """-> (data_dir | None, [trees]). Pass 1: platform candidates (first one that
+    actually contains a usable cache wins). Pass 2: bounded search from home and
+    Windows common roots. (None, []) when nothing found."""
+    home = home or os.path.expanduser("~")
+    env = dict(env) if env is not None else dict(os.environ)
+    for cand in candidate_data_dirs(home, env):
+        trees = find_shader_caches(cand)
+        if trees:
+            return cand, trees
+    roots = [home]
+    if os.name == "nt":
+        roots += [os.path.join(env.get("ProgramFiles") or "C:/Program Files"),
+                  env.get("LOCALAPPDATA") or "",
+                  os.path.join(home, "Desktop"),
+                  os.path.join(home, "Downloads")]
+    for root in roots:
+        for data_dir, trees in search_hits(root):
+            return data_dir, trees
+    return None, []

@@ -61,5 +61,31 @@ class TestFindShaderCaches(Base):
         self.assertEqual(cache_tool.find_shader_caches(os.path.join(self.tmp, "nope")), [])
 
 
+class TestDiscover(Base):
+    def test_finds_cache_in_default_candidate(self):
+        data, trees = cache_tool.discover(home=self.home, env=self.env())
+        self.assertEqual(data, self.data)
+        self.assertTrue(any(t["entries"] == 50 for t in trees))
+
+    def test_xdg_cache_home_candidate_wins(self):
+        xdg_data = os.path.join(self.tmp, "xdg", "rpcs3")
+        make_synthetic(xdg_data)
+        data, _t = cache_tool.discover(home=self.home, env=self.env(XDG_CACHE_HOME=os.path.dirname(xdg_data)))
+        self.assertEqual(data, xdg_data)
+
+    def test_search_fallback_when_no_candidate(self):
+        odd = os.path.join(self.home, "games", "rpcs3")
+        shutil.move(self.data, odd)
+        data, trees = cache_tool.discover(home=self.home, env=self.env())
+        self.assertEqual(data, odd)
+        self.assertTrue(any(t["entries"] == 50 for t in trees))
+
+    def test_nothing_found(self):
+        shutil.rmtree(self.data)
+        data, trees = cache_tool.discover(home=self.home, env=self.env())
+        self.assertIsNone(data)
+        self.assertEqual(trees, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
