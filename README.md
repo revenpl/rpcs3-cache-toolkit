@@ -65,6 +65,24 @@ python3 opt_cache.py merge  BCES01741.rsca --target ~/target/dir
   same decompiler semantics). Default is `byte-exact` (exact copy).
 - `merge --overwrite` — overwrite existing files (default: skip them).
 
+## Interactive: `cache_tool.py` (auto-discovery + import/export)
+Finds the RPCS3 data dir automatically (Windows / Linux / macOS — env overrides like
+`RPCS3_CONFIG_DIR`/`XDG_CACHE_HOME` first, then a bounded search of `$HOME`), then guides
+you: operation → game. Import lists `*.rsca` next to the scripts and merges the pick into
+the local cache; export packs the pick into `<GAMEID>.rsca` next to the scripts.
+
+```bash
+python3 cache_tool.py                          # interactive menu
+python3 cache_tool.py discover                 # show the discovered data dir + games
+python3 cache_tool.py list                     # games in the cache + .rsca files in the program folder
+python3 cache_tool.py import  BCES01741.rsca   # add a .rsca to the local cache (idempotent merge)
+python3 cache_tool.py export --game BCES01741  # pack the biggest cache dir of the game
+```
+
+Flags: `import --data DIR --ppu DIR`, `export --data DIR --ppu DIR --out DIR` (out
+defaults to the program folder). Import merges into the game's first `ppu-*` dir — pick
+another with `--ppu`. `python3 test_cache_tool.py -v` runs the suite.
+
 ## The `*.rsca` file format (RSCA v1, `format=1`)
 
 ```
