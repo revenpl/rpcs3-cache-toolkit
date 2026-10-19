@@ -83,6 +83,20 @@ Flags: `import --data DIR --ppu DIR`, `export --data DIR --ppu DIR --out DIR` (o
 defaults to the program folder). Import merges into the game's first `ppu-*` dir — pick
 another with `--ppu`. `python3 test_cache_tool.py -v` runs the suite.
 
+### Double-click launch (no terminal to type in)
+- **macOS** — double-click `cache_tool.command`: it opens a Terminal in the folder and
+  starts the interactive menu. (Want a Dock-style app instead? `osacompile -o "Cache
+  Tool.app"` on a 4-line AppleScript that runs `do script "cd <folder> && python3
+  cache_tool.py"` in Terminal — note: the path gets baked in, so the .app is not portable.)
+- **Windows** — double-click `cache_tool.bat`: console with the interactive menu; `pause`
+  keeps the window open after exit.
+- **Linux** — `./cache_tool.command` in a terminal, or right-click → "Run in Terminal".
+
+All three are just thin wrappers around `python3 cache_tool.py` from the folder they sit
+in; the menu itself needs a terminal (it is an `input()` menu), so a GUI shell around
+Python (e.g. Pythonw) would break it. On a fresh Mac without `python3`, run
+`xcode-select --install` first.
+
 ## The `*.rsca` file format (RSCA v1, `format=1`)
 
 ```
