@@ -202,5 +202,41 @@ class TestExport(Base):
         self.assertIsNone(cache_tool.select_tree(trees, "NOPE123"))
 
 
+class TestCli(Base):
+    def run_tool(self, *args, stdin=None):
+        env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
+        return subprocess.run([sys.executable, os.path.join(REPO, "cache_tool.py"), *args],
+                              input=stdin, text=True, capture_output=True, env=env)
+
+    def test_cli_discover(self):
+        r = self.run_tool("discover")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(self.data, r.stdout)
+        self.assertIn("BCES01741", r.stdout)
+
+    def test_cli_export_then_import_roundtrip(self):
+        r = self.run_tool("export")  # default tree = most entries (GOWA)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        repo_rsca = os.path.join(REPO, "BCES01741.rsca")  # default out = program folder
+        try:
+            self.assertTrue(os.path.isfile(repo_rsca))
+            dst = os.path.join(self.tmp, "dst")
+            ppu_name = "ppu-T-GOWA.SELF"
+            os.makedirs(os.path.join(dst, "cache", "BCES01741", ppu_name), exist_ok=True)
+            r2 = self.run_tool("import", repo_rsca, "--data", dst)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            sc = os.path.join(dst, "cache", "BCES01741", ppu_name, "shaders_cache")
+            self.assertTrue(os.path.isdir(os.path.join(sc, "raw")))
+            self.assertEqual(
+                len([f for f in os.listdir(os.path.join(sc, "raw")) if f.endswith((".vp", ".fp"))]), 98)
+        finally:
+            if os.path.isfile(repo_rsca):
+                os.remove(repo_rsca)
+
+    def test_cli_import_missing_file(self):
+        r = self.run_tool("import", "definitely_missing.rsca", "--data", self.tmp)
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

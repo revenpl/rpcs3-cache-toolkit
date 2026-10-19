@@ -22,6 +22,7 @@ import os
 import sys
 import hashlib
 import types
+import argparse
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROGRAM_DIR)
@@ -237,3 +238,96 @@ def do_export(data_dir, ppu_dir, out_dir, mode="byte-exact"):
     out = os.path.join(out_dir, f"{game}.rsca")
     opt_cache.cmd_pack(types.SimpleNamespace(cache=ppu_dir, out=out, game_id=game, mode=mode))
     return out
+
+
+def _resolve_data(data_arg):
+    """(data_dir, trees) from --data or auto-discovery. Exits 2 when unusable."""
+    if data_arg:
+        d = os.path.abspath(data_arg)
+        return d, find_shader_caches(d)
+    data, trees = discover()
+    if data is None:
+        if sys.stdin.isatty():
+            print("No RPCS3 shader cache found automatically.")
+            p = input("Path to the RPCS3 data dir (containing cache/<GAMEID>/), or empty to abort: ").strip()
+            if p:
+                data = os.path.abspath(p)
+                trees = find_shader_caches(data)
+    if data is None:
+        sys.stderr.write("ERROR: no RPCS3 data dir found. Pass --data DIR.\n")
+        sys.exit(2)
+    return data, trees
+
+
+def interactive():
+    raise SystemExit("interactive menu not available yet — use the subcommands "
+                     "(discover / list / import / export)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Interactive RPCS3 shader-cache manager (RSCA v1).")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("discover", help="print the auto-discovered data dir and games")
+    sub.add_parser("list", help="list cache games and .rsca files in the program folder")
+    p_in = sub.add_parser("import", help="add a .rsca file to the local RPCS3 cache")
+    p_in.add_argument("file")
+    p_in.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
+    p_in.add_argument("--ppu", help="ppu-* cache dir to merge into (default: first of the game)")
+    p_ex = sub.add_parser("export", help="pack a game cache dir into <GAMEID>.rsca")
+    p_ex.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
+    p_ex.add_argument("--game", help="game id, e.g. BCES01741 (default: cache with most entries)")
+    p_ex.add_argument("--ppu", help="exact ppu-* cache dir to export (overrides --game)")
+    p_ex.add_argument("--out", default=PROGRAM_DIR, help="output dir (default: the program folder)")
+    args = ap.parse_args(argv)
+
+    if args.cmd is None:
+        return interactive()
+
+    if args.cmd == "discover":
+        data, trees = _resolve_data(None)
+        print(f"data dir : {data}")
+        for t in trees:
+            print(f"  {t['game_id']}/{os.path.basename(t['ppu_dir'])}  ({t['entries']} entries)")
+        return 0
+
+    if args.cmd == "list":
+        data, trees = _resolve_data(None)
+        print(f"data dir : {data}")
+        for t in trees:
+            print(f"  game {t['game_id']}/{os.path.basename(t['ppu_dir'])}  ({t['entries']} entries)")
+        print(f"program  : {PROGRAM_DIR}")
+        for f in list_rsca_files(PROGRAM_DIR):
+            print(f"  .rsca {f}")
+        return 0
+
+    if args.cmd == "import":
+        data, _trees = _resolve_data(args.data)
+        f = args.file if os.path.isabs(args.file) else os.path.join(os.getcwd(), args.file)
+        if not os.path.isfile(f):
+            alt = os.path.join(PROGRAM_DIR, args.file)
+            if os.path.isfile(alt):
+                f = alt
+            else:
+                sys.stderr.write(f"ERROR: file not found: {args.file}\n")
+                return 2
+        ppu = do_import(f, data, args.ppu)
+        print(f"imported into: {ppu}")
+        return 0
+
+    # export
+    data, trees = _resolve_data(args.data)
+    if args.ppu:
+        ppu = os.path.abspath(args.ppu)
+    else:
+        t = select_tree(trees, args.game)
+        if t is None:
+            sys.stderr.write("ERROR: no cache with entries found for that game.\n")
+            return 2
+        ppu = t["ppu_dir"]
+    out = do_export(data, ppu, args.out)
+    print(f"exported    : {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
