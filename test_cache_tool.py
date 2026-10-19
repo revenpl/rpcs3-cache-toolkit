@@ -88,21 +88,22 @@ class TestDiscover(Base):
 
 
 class TestRaw(Base):
-    def test_raw_counts_and_hashes(self):
+    def test_raw_counts_per_tree(self):
         data, trees = cache_tool.discover(home=self.home, env=self.env())
-        gowa = [t for t in trees if t["entries"] == 50][0]
-        raws = cache_tool.scan_raw(gowa["sc"])
-        self.assertEqual(len(raws), 10)
-        self.assertGreater(len({r["sha256"] for r in raws}), 1)
+        by_entries = {t["entries"]: t for t in trees}
+        gowa, eboot, empty = by_entries[50], by_entries[3], by_entries[0]
+        self.assertEqual(len(cache_tool.scan_raw(gowa["sc"])), 98)  # 49 pairs (1 entry missing raw)
+        self.assertEqual(len(cache_tool.scan_raw(eboot["sc"])), 6)  # 3 pairs
+        self.assertEqual(cache_tool.scan_raw(empty["sc"]), [])
 
     def test_raw_hash_matches_sha256sum(self):
         import hashlib
         data, trees = cache_tool.discover(home=self.home, env=self.env())
         gowa = [t for t in trees if t["entries"] == 50][0]
-        raws = {os.path.basename(r["path"]): r for r in cache_tool.scan_raw(gowa["sc"])}
-        p = os.path.join(gowa["sc"], "raw", "raw_0000000000000000.bin")
-        h = hashlib.sha256(open(p, "rb").read()).hexdigest()
-        self.assertEqual(raws["raw_0000000000000000.bin"]["sha256"], h)
+        r = cache_tool.scan_raw(gowa["sc"])[0]
+        h = hashlib.sha256(open(r["path"], "rb").read()).hexdigest()
+        self.assertEqual(r["sha256"], h)
+        self.assertGreater(len({x["sha256"] for x in cache_tool.scan_raw(gowa["sc"])}), 1)
 
 
 if __name__ == "__main__":

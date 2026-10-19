@@ -156,15 +156,14 @@ def _sha256_file(path):
 
 
 def scan_raw(sc):
-    """All raw/*.bin under a shaders_cache dir, sorted by filename.
-    -> [{path, size, sha256}, ...]"""
+    """All shader binaries under <sc>/raw/ (real layout: <HASH>.vp / <HASH>.fp),
+    sorted by filename. -> [{path, size, sha256}, ...]"""
     raws = []
     raw_dir = os.path.join(sc, "raw")
     if not os.path.isdir(raw_dir):
         return raws
     for name in sorted(os.listdir(raw_dir)):
         p = os.path.join(raw_dir, name)
-        if not (name.endswith(".bin") and os.path.isfile(p)):
-            continue
-        raws.append({"path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)})
+        if os.path.isfile(p):
+            raws.append({"path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)})
     return raws
