@@ -37,5 +37,29 @@ class TestScaffold(unittest.TestCase):
         self.assertTrue(os.path.isdir(cache_tool.PROGRAM_DIR))
 
 
+class TestCandidateDirs(Base):
+    def test_linux_candidates_include_home_cache(self):
+        cands = cache_tool.candidate_data_dirs(self.home, self.env())
+        self.assertIn(self.data, cands)
+
+    def test_xdg_cache_home_respected(self):
+        xdg = os.path.join(self.tmp, "xdg")
+        cands = cache_tool.candidate_data_dirs(self.home, self.env(XDG_CACHE_HOME=xdg))
+        self.assertIn(os.path.join(xdg, "rpcs3"), cands)
+
+
+class TestFindShaderCaches(Base):
+    def test_finds_gowa_and_eboot(self):
+        trees = cache_tool.find_shader_caches(self.data)
+        self.assertEqual({t["game_id"] for t in trees}, {"BCES01741"})
+        self.assertEqual(len(trees), 3)
+        gowa = [t for t in trees if t["entries"] == 50]
+        self.assertEqual(len(gowa), 1)
+        self.assertTrue(gowa[0]["ppu_dir"].endswith("GOWA.SELF"))
+
+    def test_missing_data_dir_returns_empty(self):
+        self.assertEqual(cache_tool.find_shader_caches(os.path.join(self.tmp, "nope")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
