@@ -87,5 +87,23 @@ class TestDiscover(Base):
         self.assertEqual(trees, [])
 
 
+class TestRaw(Base):
+    def test_raw_counts_and_hashes(self):
+        data, trees = cache_tool.discover(home=self.home, env=self.env())
+        gowa = [t for t in trees if t["entries"] == 50][0]
+        raws = cache_tool.scan_raw(gowa["sc"])
+        self.assertEqual(len(raws), 10)
+        self.assertGreater(len({r["sha256"] for r in raws}), 1)
+
+    def test_raw_hash_matches_sha256sum(self):
+        import hashlib
+        data, trees = cache_tool.discover(home=self.home, env=self.env())
+        gowa = [t for t in trees if t["entries"] == 50][0]
+        raws = {os.path.basename(r["path"]): r for r in cache_tool.scan_raw(gowa["sc"])}
+        p = os.path.join(gowa["sc"], "raw", "raw_0000000000000000.bin")
+        h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+        self.assertEqual(raws["raw_0000000000000000.bin"]["sha256"], h)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -145,3 +145,26 @@ def discover(home=None, env=None):
         for data_dir, trees in search_hits(root):
             return data_dir, trees
     return None, []
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_raw(sc):
+    """All raw/*.bin under a shaders_cache dir, sorted by filename.
+    -> [{path, size, sha256}, ...]"""
+    raws = []
+    raw_dir = os.path.join(sc, "raw")
+    if not os.path.isdir(raw_dir):
+        return raws
+    for name in sorted(os.listdir(raw_dir)):
+        p = os.path.join(raw_dir, name)
+        if not (name.endswith(".bin") and os.path.isfile(p)):
+            continue
+        raws.append({"path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)})
+    return raws
