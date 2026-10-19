@@ -259,9 +259,72 @@ def _resolve_data(data_arg):
     return data, trees
 
 
+def _pick(prompt, n):
+    while True:
+        v = input(prompt).strip()
+        if v.isdigit() and 1 <= int(v) <= n:
+            return int(v) - 1
+        print(f"enter a number 1..{n}")
+
+
 def interactive():
-    raise SystemExit("interactive menu not available yet — use the subcommands "
-                     "(discover / list / import / export)")
+    data, trees = discover()
+    if data is None:
+        print("No RPCS3 shader cache found automatically.")
+        try:
+            p = input("Path to the RPCS3 data dir (containing cache/<GAMEID>/), or empty to abort: ").strip()
+        except EOFError:
+            return 1
+        if not p:
+            return 1
+        data = os.path.abspath(p)
+        trees = find_shader_caches(data)
+    print(f"data dir : {data}")
+    for t in trees:
+        print(f"  game {t['game_id']}/{os.path.basename(t['ppu_dir'])}  ({t['entries']} entries)")
+    if not trees:
+        print("  (no shader caches yet — play a game first)")
+    while True:
+        print()
+        print("  [1] add a cache to RPCS3 (import a .rsca file)")
+        print("  [2] export a game cache to .rsca")
+        print("  [0] quit")
+        try:
+            c = input("> ").strip()
+        except EOFError:
+            return 1
+        if c == "1":
+            rsca = list_rsca_files(PROGRAM_DIR)
+            if not rsca:
+                print(f"no .rsca files in {PROGRAM_DIR}")
+                continue
+            for i, f in enumerate(rsca, 1):
+                print(f"  [{i}] {f}")
+            i = _pick("file: ", len(rsca))
+            f = rsca[i]
+            try:
+                game = read_rsca_game_id(os.path.join(PROGRAM_DIR, f))
+            except ValueError as e:
+                print(e)
+                continue
+            ppu = pick_ppu_dir(data, game)
+            if ppu is None:
+                print(f"ERROR: no ppu-* cache dir for {game} under {os.path.join(data, 'cache')} — "
+                      "launch the game once in RPCS3 first.")
+                continue
+            do_import(os.path.join(PROGRAM_DIR, f), data, ppu)
+            return 0
+        if c == "2":
+            if not trees:
+                print("no shader caches to export")
+                continue
+            for i, t in enumerate(trees, 1):
+                print(f"  [{i}] {t['game_id']}/{os.path.basename(t['ppu_dir'])}  ({t['entries']} entries)")
+            i = _pick("cache dir: ", len(trees))
+            do_export(data, trees[i]["ppu_dir"], PROGRAM_DIR)
+            return 0
+        if c == "0":
+            return 0
 
 
 def main(argv=None):

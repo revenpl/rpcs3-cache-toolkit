@@ -238,5 +238,24 @@ class TestCli(Base):
         self.assertEqual(r.returncode, 2)
 
 
+class TestInteractive(Base):
+    def test_interactive_export_flow(self):
+        # menu: 2 = export; tree list is sorted: [1] empty, [2] GOWA(50), [3] EBOOT(3)
+        env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "cache_tool.py")],
+                           input="2\n2\n", text=True, capture_output=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("BCES01741.rsca", r.stdout)
+        repo_rsca = os.path.join(REPO, "BCES01741.rsca")
+        self.assertTrue(os.path.isfile(repo_rsca))
+        os.remove(repo_rsca)  # tests must not pollute the repo
+
+    def test_inter_quit(self):
+        env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "cache_tool.py")],
+                           input="0\n", text=True, capture_output=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
