@@ -216,3 +216,24 @@ def do_import(rsca_path, data_dir, ppu_dir=None):
                 f"  or pass --ppu DIR explicitly.")
     opt_cache.cmd_merge(types.SimpleNamespace(pack=rsca_path, target=ppu_dir, overwrite=False))
     return ppu_dir
+
+
+def select_tree(trees, game=None):
+    """Best cache tree to export: of the game's trees with entries, the largest
+    (ties broken by path). None when the game has no usable cache."""
+    cands = [t for t in trees
+             if t["entries"] > 0 and (game is None or t["game_id"].lower() == game.lower())]
+    if not cands:
+        return None
+    return max(cands, key=lambda t: (t["entries"], t["ppu_dir"]))
+
+
+def do_export(data_dir, ppu_dir, out_dir, mode="byte-exact"):
+    """Pack one cache tree into <out_dir>/<GAMEID>.rsca. Returns the output path."""
+    os.makedirs(out_dir, exist_ok=True)
+    game = os.path.basename(os.path.dirname(os.path.abspath(ppu_dir)))
+    if game.lower() == "cache":
+        game = "UNKNOWN"
+    out = os.path.join(out_dir, f"{game}.rsca")
+    opt_cache.cmd_pack(types.SimpleNamespace(cache=ppu_dir, out=out, game_id=game, mode=mode))
+    return out

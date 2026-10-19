@@ -175,5 +175,32 @@ class TestRscaHelpers(Base):
             cache_tool.do_import(rsca, bare)
 
 
+class TestExport(Base):
+    def _ppu_with_entries(self):
+        trees = [t for t in cache_tool.find_shader_caches(self.data) if t["entries"] > 0]
+        return max(trees, key=lambda t: t["entries"])["ppu_dir"]
+
+    def test_export_writes_rsca_named_by_game(self):
+        out = cache_tool.do_export(self.data, self._ppu_with_entries(), self.tmp)
+        self.assertEqual(out, os.path.join(self.tmp, "BCES01741.rsca"))
+        self.assertTrue(os.path.isfile(out))
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(4), b"RSCA")
+
+    def test_export_roundtrip_parses(self):
+        out = cache_tool.do_export(self.data, self._ppu_with_entries(), self.tmp)
+        import opt_cache
+        gid, _cls, _ver, _mode, raw, _tabs, ent = opt_cache._parse_pack(open(out, "rb").read())
+        self.assertEqual(gid, "BCES01741")
+        self.assertEqual(len(ent), 50)
+        self.assertEqual(len(raw), 98)
+
+    def test_select_tree_prefers_most_entries(self):
+        trees = cache_tool.find_shader_caches(self.data)
+        t = cache_tool.select_tree(trees, "BCES01741")
+        self.assertEqual(t["entries"], 50)
+        self.assertIsNone(cache_tool.select_tree(trees, "NOPE123"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
