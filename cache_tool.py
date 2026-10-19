@@ -324,20 +324,33 @@ def _ppu_label(ppu_dir):
 
 
 def _game_library_roots(data_dir):
-    """Where RPCS3 looks for game dirs: dev_disk* paths from config.yml,
-    then the platform default library (C:/Games/PS3 or ~/Games/PS3)."""
+    """Where RPCS3 looks for game dirs — real VFS keys (rpcs3/Emu/vfs_config.h):
+    dev_hdd0 (PS3_GAME/...), dev_bdvd (mounted disc), games_dir — as configured in
+    config.yml (VFS section), else their defaults under the data dir; plus the
+    platform default library (C:/Games/PS3 or ~/Games/PS3)."""
     roots = []
     cfg = os.path.join(data_dir, "config.yml")
     if os.path.isfile(cfg):
         try:
             import re
             with open(cfg, errors="replace") as f:
-                for m in re.finditer(r"dev_disk\d+\s*:\s*(\S+)", f.read()):
+                txt = f.read()
+            for key in ("dev_hdd0", "dev_hdd1", "dev_bdvd", "games_dir"):
+                m = re.search(rf"{key}\s*:\s*(\S+)", txt)
+                if m:
                     p = m.group(1).strip("'\"")
                     if p and p not in roots:
                         roots.append(p)
         except OSError:
             pass
+    for key, sub in (("dev_hdd0", "PS3_GAME"), ("dev_bdvd", "PS3_GAME"),
+                     ("games_dir", None), ("dev_bdvd", None)):
+        # defaults live under the data dir when config.yml doesn't override them
+        d = os.path.join(data_dir, key) if key != "games_dir" else os.path.join(data_dir, "games")
+        if os.path.isdir(d):
+            r = os.path.join(d, sub) if sub else d
+            if r not in roots:
+                roots.append(r)
     if os.name == "nt":
         roots.append(os.path.join("C:", "Games", "PS3"))
     else:
@@ -356,8 +369,8 @@ def game_title(game_id, data_dir):
         return _TITLE_CACHE[key]
     title = None
     for root in _game_library_roots(data_dir):
-        for sub in ("BLURAY", "PS3_GAME"):
-            p = os.path.join(root, key, sub, "PARAM.SFO")
+        for rel in (key, os.path.join(key, "BLURAY"), os.path.join(key, "PS3_GAME")):
+            p = os.path.join(root, rel, "PARAM.SFO")
             if not os.path.isfile(p):
                 continue
             try:

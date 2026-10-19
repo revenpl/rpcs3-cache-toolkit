@@ -100,9 +100,11 @@ python3 cache_tool.py export --game BCES01277  # pack one specific game (all its
 Games are shown by **title + code** (e.g. `God of War (BCES01741)`) and by module
 label (`GOWA.SELF`, `EBOOT.BIN`), never by the raw `ppu-<hash>-` dir name. The title
 comes from the **local** game's `PARAM.SFO` (`NPTITLE`) — no network — so the game dir
-must exist under a library path: `dev_disk0..N` from `config.yml`, else the platform
-default (`C:\Games\PS3` on Windows, `~/Games/PS3` elsewhere). If it isn't found, the
-line falls back to the bare code (`BCES01741`).
+must exist under a library path: the `VFS` section of `config.yml` (`dev_hdd0`,
+`dev_bdvd`, `games_dir`), the defaults under the data dir
+(`<data>/dev_hdd0/PS3_GAME/...` etc.), or the platform default
+(`C:\Games\PS3` on Windows, `~/Games/PS3` elsewhere). If it isn't found, the line
+falls back to the bare code (`BCES01741`).
 
 Flags: `import --data DIR --ppu DIR`, `export --data DIR --ppu DIR --out DIR`
 (out defaults to the program folder). Module-matching rules on import:
@@ -116,7 +118,7 @@ Flags: `import --data DIR --ppu DIR`, `export --data DIR --ppu DIR --out DIR`
   the file's is chosen (a cache only grows); a tie → the tool asks for `--ppu DIR`.
   Never guesses silently.
 
-`python3 -m unittest test_export -v` runs the suite (26 tests, incl. a real-file
+`python3 -m unittest test_export -v` runs the suite (27 tests, incl. a real-file
 round-trip when the user's `BCES01741.rsca` is present, and PSF/SFO title-lookup tests).
 
 ### Double-click launch (no terminal to type in)
@@ -202,7 +204,7 @@ per-entry integrity check on pack (`state_hash N OK / M BAD`).
 ### Verification
 
 Synthetic suite (two games, 6 ppu dirs incl. empties, v1 + v2, import/export/CLI/
-interactive — 26 tests, `test_export.py`):
+interactive — 27 tests, `test_export.py`):
 
 | check | result |
 |---|---|
@@ -211,7 +213,7 @@ interactive — 26 tests, `test_export.py`):
 | v1 legacy import into a 2-module game | ok (closest-entry-count disambiguation; tie → asks `--ppu`) |
 | interactive import + export flows | ok |
 | CLI import/export (default game, by game, error paths) | ok |
-| game title from local `PARAM.SFO` (NPTITLE), offline | ok (synthetic PSF; `config.yml` dev_disk0 root; fallback to bare code) |
+| game title from local `PARAM.SFO` (NPTITLE), offline | ok (synthetic PSF; `config.yml` dev_hdd0 root; `<data>/dev_hdd0/PS3_GAME` default; fallback to bare code) |
 
 Real file (user's `BCES01741.rsca`, RSCA v1, 622 entries, 739 raw, `vulkan/v1.94`):
 

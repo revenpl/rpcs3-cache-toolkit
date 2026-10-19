@@ -400,8 +400,8 @@ class TestGameNames(Base):
         self.assertIn("coo.ppu.self", l1277)
         self.assertTrue(l1277.startswith("  game BCES01277"))  # no title -> bare id
 
-    def test_config_dev_disk_root(self):
-        # dev_disk0 path from config.yml must be used as library root
+    def test_config_dev_hdd0_root(self):
+        # dev_hdd0 path from config.yml must be used as library root
         lib2 = os.path.join(self.root, "library2")
         g2 = os.path.join(lib2, "BCES01277", "PS3_GAME")
         os.makedirs(g2)
@@ -409,10 +409,21 @@ class TestGameNames(Base):
         with open(os.path.join(g2, "PARAM.SFO"), "wb") as f:
             f.write(sfo)
         with open(os.path.join(self.data, "config.yml"), "w") as f:
-            f.write("VFS:\n  dev_disk0: '%s'\n" % lib2)
-        cache_tool._game_library_roots = self._orig_roots  # real fn: config.yml + platform default
+            f.write("VFS:\n  dev_hdd0: '%s'\n" % lib2)
+        cache_tool._game_library_roots = self._orig_roots  # real fn: config.yml + defaults
         cache_tool._TITLE_CACHE.clear()
         self.assertEqual(cache_tool.game_title("BCES01277", self.data), "God of War Collection 2")
+
+    def test_data_dir_dev_hdd0_default(self):
+        # installed game under <data>/dev_hdd0/PS3_GAME (no config override)
+        g = os.path.join(self.data, "dev_hdd0", "PS3_GAME", "BCES01741")
+        os.makedirs(g)
+        sfo = _make_sfo([("NPTITLE", "God of War", 64)])
+        with open(os.path.join(g, "PARAM.SFO"), "wb") as f:
+            f.write(sfo)
+        cache_tool._game_library_roots = self._orig_roots  # real fn (config has no dev_hdd0 -> default)
+        cache_tool._TITLE_CACHE.clear()
+        self.assertEqual(cache_tool.game_title("BCES01741", self.data), "God of War")
 
 
 if __name__ == "__main__":
