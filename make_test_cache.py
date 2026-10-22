@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""Build a synthetic RPCS3 shaders_cache with the REAL layout (v0.0.43):
+"""Build a synthetic RPCS3 FORK shaders_cache in the REAL SPLIT layout:
+
     <ROOT>/cache/<GAMEID>/ppu-<hash>-<SELF>/shaders_cache/
-        raw/<HASH>.vp|.fp
-        pipelines/vulkan/v1.95/<VP>+<FP>+<S>+<H>.bin
-    Entry = 672 B (uniform), first 16 bytes = u64 vp_hash + u64 fp_hash (LE).
+        raw/<HASH>.vp | <HASH>.fp
+        pipelines/vulkan/v1.96/pipelines.bin          RSPL (16 B header + N*320)
+        pipelines/vulkan/v1.96/device/<KEY>/props.bin RSPT (16 B header + N*480)
+
+RSPL/RSPT header = magic(u32) + ver(u32) + count(u32) + rec(u32). The exporter
+only needs a valid header + count*rec payload + consistent raw files for a
+byte-exact round-trip.
 
 Games:
-  BCES01741 (God of War): GOWA.SELF 50 entries (1 with missing raw, v1.95),
-      EBOOT.BIN 3 entries (old vulkan/v1 dir), one EMPTY ppu dir (must be skipped).
-  BCES01277 (God of War Collection 2): coo.ppu.self 8 entries, EBOOT.BIN 4
-      entries, ghs.ppu.self EMPTY (never played — must be skipped by export).
+  BCES01741 (God of War):
+    GOWA.SELF   50 pipelines (split, 1 AMD device)
+    EBOOT.BIN    3 pipelines (split, 1 AMD device)
+    ppu-000...-  EMPTY (raw/ + pipelines/ dirs, no data)  -> must be skipped
+    legacy.SELF  LEGACY (per-entry .bin)                  -> must be ignored
+  BCES01277 (God of War Collection):
+    coo.ppu.self  8 pipelines (split, 2 devices)
+    EBOOT.BIN      4 pipelines (split, 1 device)
+    ghs.ppu.self   EMPTY -> must be skipped
 """
 import os
 import struct
@@ -18,62 +28,87 @@ import sys
 
 random.seed(42)
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/test_rpc")
-ENTRY = 672
+
+RSPL_MAGIC = 0x4C505352  # "RSPL"
+RSPT_MAGIC = 0x54505352  # "RSPT"
+RSPL_REC = 320
+RSPT_REC = 480
+VERSION = "v1.96"
+AMD = "1002_67B0"
+NVIDIA = "10DE_2184"
 
 
-def mk_entry(sc, pdir, vp, fp, size=ENTRY):
-    d = os.path.join(sc, *pdir.split("/"))
-    os.makedirs(d, exist_ok=True)
-    name = f"{vp:X}+{fp:X}+{random.getrandbits(64):X}+{random.getrandbits(64):X}.bin"
-    with open(os.path.join(d, name), "wb") as f:
-        f.write(struct.pack("<QQ", vp, fp) + os.urandom(size - 16))
-
-
-def mk_raw(sc, vp, fp):
+def write_split(ppu_dir, n, devices):
+    """Create a valid split cache under <ppu_dir>/shaders_cache with n pipelines
+    and the given device list (each a (key, count) tuple)."""
+    sc = os.path.join(ppu_dir, "shaders_cache")
     raw = os.path.join(sc, "raw")
+    vdir = os.path.join(sc, "pipelines", "vulkan", VERSION)
     os.makedirs(raw, exist_ok=True)
-    with open(os.path.join(raw, f"{vp:X}.vp"), "wb") as f:
-        f.write(os.urandom(random.randint(32, 512)))
-    with open(os.path.join(raw, f"{fp:X}.fp"), "wb") as f:
-        f.write(os.urandom(random.randint(32, 1024)))
+    for key, _cnt in devices:
+        os.makedirs(os.path.join(vdir, "device", key), exist_ok=True)
+
+    pl = bytearray(struct.pack("<IIII", RSPL_MAGIC, 1, n, RSPL_REC))
+    props = {key: bytearray(struct.pack("<IIII", RSPT_MAGIC, 1, cnt, RSPT_REC))
+             for key, cnt in devices}
+
+    for i in range(n):
+        vph = random.getrandbits(64)
+        fph = random.getrandbits(64)
+        psh = random.getrandbits(64)
+        pl += struct.pack("<QQQ", vph, fph, psh) + os.urandom(RSPL_REC - 24)
+        with open(os.path.join(raw, f"{vph:X}.vp"), "wb") as f:
+            f.write(os.urandom(random.randint(64, 512)))
+        with open(os.path.join(raw, f"{fph:X}.fp"), "wb") as f:
+            f.write(os.urandom(random.randint(64, 1024)))
+        for key, cnt in devices:
+            if i < cnt:
+                props[key] += struct.pack("<QQQQ", vph, fph, random.getrandbits(64), psh)
+                props[key] += os.urandom(RSPT_REC - 32)
+
+    with open(os.path.join(vdir, "pipelines.bin"), "wb") as f:
+        f.write(bytes(pl))
+    for key, data in props.items():
+        with open(os.path.join(vdir, "device", key, "props.bin"), "wb") as f:
+            f.write(bytes(data))
 
 
-# Game 1: BCES01741 (God of War)
-g1 = os.path.join(ROOT, "cache", "BCES01741", "ppu-AAA111-GOWA.SELF", "shaders_cache")
-for i in range(50):
-    vp, fp = random.getrandbits(64), random.getrandbits(64)
-    mk_entry(g1, "pipelines/vulkan/v1.95", vp, fp)
-    if i != 49:  # last one: missing raw files
-        mk_raw(g1, vp, fp)
+def make_legacy(ppu_dir, n):
+    """LEGACY layout (per-entry .bin) — present only to verify the exporter ignores it."""
+    sc = os.path.join(ppu_dir, "shaders_cache")
+    pdir = os.path.join(sc, "pipelines", "vulkan", "v1.95")
+    raw = os.path.join(sc, "raw")
+    os.makedirs(pdir, exist_ok=True)
+    os.makedirs(raw, exist_ok=True)
+    for i in range(n):
+        vp, fp = random.getrandbits(64), random.getrandbits(64)
+        name = f"{vp:X}+{fp:X}+{random.getrandbits(64):X}+{random.getrandbits(64):X}.bin"
+        with open(os.path.join(pdir, name), "wb") as f:
+            f.write(struct.pack("<QQ", vp, fp) + os.urandom(672 - 16))
+        with open(os.path.join(raw, f"{vp:X}.vp"), "wb") as f:
+            f.write(os.urandom(64))
 
-g1e = os.path.join(ROOT, "cache", "BCES01741", "ppu-BBB222-EBOOT.BIN", "shaders_cache")
-for i in range(3):
-    vp, fp = random.getrandbits(64), random.getrandbits(64)
-    mk_entry(g1e, "pipelines/vulkan/v1", vp, fp)
-    mk_raw(g1e, vp, fp)
 
-# empty dir — must be skipped by export (raw+pipelines dirs exist, no .bin)
-g1x = os.path.join(ROOT, "cache", "BCES01741", "ppu-0000000000000000000000000000-", "shaders_cache")
-os.makedirs(os.path.join(g1x, "raw"), exist_ok=True)
-os.makedirs(os.path.join(g1x, "pipelines", "vulkan", "v1.95"), exist_ok=True)
+def make_empty(ppu_dir):
+    """Empty module: raw/ + pipelines/ dirs exist but no data -> must be skipped."""
+    sc = os.path.join(ppu_dir, "shaders_cache")
+    os.makedirs(os.path.join(sc, "raw"), exist_ok=True)
+    os.makedirs(os.path.join(sc, "pipelines", "vulkan", VERSION), exist_ok=True)
 
-# Game 2: BCES01277 (God of War Collection 2) — one module per playable game
-g2 = os.path.join(ROOT, "cache", "BCES01277", "ppu-CCC333-coo.ppu.self", "shaders_cache")
-for i in range(8):
-    vp, fp = random.getrandbits(64), random.getrandbits(64)
-    mk_entry(g2, "pipelines/vulkan/v1.95", vp, fp)
-    mk_raw(g2, vp, fp)
 
-g2e = os.path.join(ROOT, "cache", "BCES01277", "ppu-DDD444-EBOOT.BIN", "shaders_cache")
-for i in range(4):
-    vp, fp = random.getrandbits(64), random.getrandbits(64)
-    mk_entry(g2e, "pipelines/vulkan/v1.95", vp, fp)
-    mk_raw(g2e, vp, fp)
+# --- Game 1: BCES01741 (God of War) ---
+g1 = os.path.join(ROOT, "cache", "BCES01741")
+write_split(os.path.join(g1, "ppu-AAA111-GOWA.SELF"), 50, [(AMD, 50)])
+write_split(os.path.join(g1, "ppu-BBB222-EBOOT.BIN"), 3, [(AMD, 3)])
+make_empty(os.path.join(g1, "ppu-0000000000000000000000000000-"))
+make_legacy(os.path.join(g1, "ppu-LEG111-legacy.SELF"), 6)
 
-# never played — empty, must be skipped
-g2x = os.path.join(ROOT, "cache", "BCES01277", "ppu-EEEE555-ghs.ppu.self", "shaders_cache")
-os.makedirs(os.path.join(g2x, "raw"), exist_ok=True)
-os.makedirs(os.path.join(g2x, "pipelines", "vulkan", "v1.95"), exist_ok=True)
+# --- Game 2: BCES01277 (God of War Collection) ---
+g2 = os.path.join(ROOT, "cache", "BCES01277")
+write_split(os.path.join(g2, "ppu-CCC333-coo.ppu.self"), 8, [(AMD, 8), (NVIDIA, 8)])
+write_split(os.path.join(g2, "ppu-DDD444-EBOOT.BIN"), 4, [(NVIDIA, 4)])
+make_empty(os.path.join(g2, "ppu-EEEE555-ghs.ppu.self"))
 
-print(f"synthetic cache at {ROOT}: BCES01741 (GOWA 50, EBOOT 3, 1 empty), "
-      f"BCES01277 (coo 8, EBOOT 4, ghs empty)")
+print(f"synthetic SPLIT cache at {ROOT}:")
+print(f"  BCES01741: GOWA 50 (split), EBOOT 3 (split), 1 empty, 1 legacy (ignored)")
+print(f"  BCES01277: coo 8 (split, 2 devices), EBOOT 4 (split), ghs empty (ignored)")

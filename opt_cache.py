@@ -1,672 +1,516 @@
 #!/usr/bin/env python3
 """
-opt_cache.py — RPCS3 shaders_cache (Vulkan) <-> RSCA (RPCS3 Shader Cache Archive).
+opt_cache.py — portable exporter / importer for the RPCS3 FORK's SPLIT shader cache.
 
-A game (one <GAMEID> dir) contains one shaders_cache per PPU module
-(ppu-<hash>-EBOOT.BIN, ppu-<hash>-GOWA.SELF, ppu-<hash>-coo.ppu.self, ...).
-A collection title (e.g. BCES01277 = God of War Collection 2) has one module
-per playable game, so a useful export = ALL non-empty modules of the game,
-in one file.
+This toolkit targets the fork's SPLIT cache format only (the stock/legacy
+tar.gz ".rsca" format is gone — this is an exporter for the fork, so it
+speaks the fork's native layout):
 
-File format
------------
-RSCA v2 (current) — one file per game:
-    0    4   magic "RSCA"
-    4    4   format = 2
-    8   16   game_id
-    24   4   module_count M
-    per module:
-          4   name_len, then name bytes   (ppu dir name, e.g. "ppu-AAA-GOWA.SELF")
-         16   backend            (e.g. "vulkan")
-         16   cache_version      (e.g. "v1.95" — per module, modules may differ)
-          ... BODY
+    <data>/cache/<GAMEID>/ppu-<hash>-<SELF>/shaders_cache/
+        raw/<HASH>.vp | <HASH>.fp            shader source, byte-exact
+        pipelines/vulkan/<version>/pipelines.bin   RSPL manifest (record 320)
+        pipelines/vulkan/<version>/device/<KEY>/props.bin  RSPT (record 480)
 
-RSCA v1 (legacy, import-only) — one file per module:
-    0    4   magic "RSCA"
-    4    4   format = 1
-    8   16   game_id
-    24  16   backend
-    40  16   cache_version
-    56   ... BODY
+It packs a whole game (every non-empty module) into ONE self-contained,
+portable `.rpo` file, and unpacks it back into a fork-ready directory tree —
+no RPCS3 install, no version or driver matching, idempotent.
 
-BODY (same in v1 and v2):
-    4    raw_count, then 4 reserved (whole-blob zlib mode)
-    per raw file: 4 name_len + name, 4 data_len
-    4    blob_c_len, then zlib(9) of all raw files concatenated (sorted by name)
-    1    mode (0 = byte-exact, 1 = normalized) + 3 pad
-    4    N = entry count
-    4    Uvp / Ufp / Upr (unique vp / fp / props rows)
-    vp rows  = 8B vph + 168B scalar   (entry[24:192])
-    fp rows  = 8B fph +  32B scalar   (entry[192:224])
-    props    = 8B psh + 448B block    (entry[224:672])
-    N x (4 vp_idx, 4 fp_idx, 4 props_idx)
+    .rpo  (RSPO-01, optional zstd)
+    ├── manifest.json
+    │     gameId, module_count,
+    │     modules: [ {name, raw_count, device_count, pipeline_count,
+    │                 devices[], sha256{pipelines.bin, raw{}, devices{}}} ]
+    ├── <ppu>/pipelines.bin
+    ├── <ppu>/device/<KEY>/props.bin
+    ├── <ppu>/raw/<HASH>.vp | <HASH>.fp
+    └── ... (one namespace per ppu module)
 
-Layout of one 672-byte pipeline_data entry (from rsx_cache.h, verified):
-  0    8  vertex_program_hash
-  8    8  fragment_program_hash
-  16   8  pipeline_storage_hash
-  24  168  vp scalar (ctrl, masks, jump table, ...)
-  192  32  fp scalar (ctrl, texcoord, lighting, mrt, ...)
-  224 448  pipeline_properties (Vulkan descriptors — parameters, not compiled code)
-  672    (end)
-
-state_hash (4th hash in the entry filename) = FNV-1a 64 over 14 u32 params,
-NOT including base_address/entry  -> invariant under normalization.
-
-Modes:
-  byte-exact : keep original base_address/entry  -> round-trip byte-identical
-  normalized : base_address->0, entry->(entry-base) -> smaller, same decompiler
-               semantics (VertexProgramDecompiler only uses entry-base_address)
+Usage:
+  python3 opt_cache.py export <gameId|ppu-dir> <out.rpo> [--level 9] [--root DIR]
+  python3 opt_cache.py unpack <in.rpo> <gameDir|dataDir> [--ppu NAME]
+  python3 opt_cache.py list   <in.rpo>
+  python3 opt_cache.py verify <in.rpo>
 """
+
+import argparse
+import hashlib
+import json
 import os
 import struct
 import sys
-import argparse
-import collections
-import zlib
+from pathlib import Path
 
-VP_SCAL  = 168               # entry[24:192]
-FP_SCAL  = 32                # entry[192:224]
-PROPS    = 448               # entry[224:672]
-MASK = (1 << 64) - 1
-SEED = 14695981039346656037
-PRIME = 1099511628211
-MAGIC = b"RSCA"
-FORMAT = 2                   # RSCA v2 = one file per game (all non-empty modules)
-FORMAT_V1 = 1                # legacy: one file per module (import-only)
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
 
+# --- split cache format (authoritative: the fork) ---
+RSPL_MAGIC = 0x4C505352  # "RSPL" little-endian  (pipelines.bin)
+RSPT_MAGIC = 0x54505352  # "RSPT" little-endian  (device/<key>/props.bin)
+RSPL_HEADER = 16
+RSPT_HEADER = 16
+RSPL_RECORD = 320
+RSPT_RECORD = 480
 
-def u8(b, o):  return b[o]
-def u16(b, o): return struct.unpack_from("<H", b, o)[0]
-def u32(b, o): return struct.unpack_from("<I", b, o)[0]
-def u64(b, o): return struct.unpack_from("<Q", b, o)[0]
-
-
-def state_hash(b):
-    params = [u32(b, 24), u32(b, 28), u32(b, 192), u32(b, 32), u32(b, 196),
-              u32(b, 200), u16(b, 204), u16(b, 206), u16(b, 208), u16(b, 210),
-              u16(b, 212), u16(b, 184), u16(b, 214), u32(b, 216)]
-    h = SEED
-    for v in params:
-        h ^= v
-        h = (h * PRIME) & MASK
-    return h
+# --- .rpo container ---
+RSPO_MAGIC = b"RSPO"
+RSPO_HEADER = 12  # magic(4) + format_ver(u32) + entry_count(u32)
+# every entry (incl. manifest.json) is: name \x00 flag u32-orig u32-payload payload
 
 
-def find_pipelines_dir(cache_root):
-    """Leaf dir under cache_root holding the most .bin pipeline files."""
-    best = (None, 0)
-    for root, dirs, files in os.walk(cache_root):
-        if "pipelines" not in root:
-            continue
-        n = sum(1 for f in files if f.endswith(".bin"))
-        if n > best[1]:
-            best = (root, n)
-    return best
+def _zstd_available() -> bool:
+    return zstd is not None
 
 
-def normalize_vp_scalar(s):
-    # s = 168-byte vp scalar (entry[24:192])
-    # base_address at entry[112] -> scalar[88]; entry at entry[116] -> scalar[92]
-    s = bytearray(s)
-    base = u32(bytes(s), 88)
-    ent = u32(bytes(s), 92)
-    s[88:92] = (0).to_bytes(4, "little")
-    s[92:96] = ((ent - base) & 0xFFFFFFFF).to_bytes(4, "little")
-    return bytes(s)
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# packing
-# ---------------------------------------------------------------------------
-def _cache_root_from_pipelines(pipelines_leaf):
-    # pipelines_leaf = .../shaders_cache/pipelines/<cls>/<ver>
-    parts = pipelines_leaf.split(os.sep)
-    return os.sep.join(parts[:-3])
+# --------------------------------------------------------------------------- #
+# split cache discovery
+# --------------------------------------------------------------------------- #
+def _count_files(p: Path) -> int:
+    if not p.is_dir():
+        return 0
+    return sum(1 for f in p.iterdir() if f.is_file())
 
 
-def _find_raw_dir(cache_root):
-    raw = os.path.join(cache_root, "raw")
-    if os.path.isdir(raw):
-        return raw
-    for root, dirs, files in os.walk(cache_root):
-        if "raw" in dirs:
-            return os.path.join(root, "raw")
-    return None
+def _split_cache_stats(raw_dir: Path, device_dir: Path):
+    """-> (raw_count, device_count, devices[{key,count,size}])."""
+    raw_count = _count_files(raw_dir)
+    devices = []
+    if device_dir.is_dir():
+        for sub in sorted(device_dir.iterdir()):
+            if not sub.is_dir():
+                continue
+            props = sub / "props.bin"
+            count = 0
+            size = 0
+            if props.is_file():
+                size = props.stat().st_size
+                d = props.read_bytes()
+                if len(d) >= RSPT_HEADER:
+                    count = struct.unpack_from("<I", d, 8)[0]
+            devices.append({"key": sub.name, "count": count, "size": size})
+    device_count = sum(d["count"] for d in devices)
+    return raw_count, device_count, devices
 
 
-def _read_raw(raw_dir):
-    out = []
-    for name in sorted(os.listdir(raw_dir)):
-        if not (name.endswith(".vp") or name.endswith(".fp")):
-            continue
-        with open(os.path.join(raw_dir, name), "rb") as f:
-            out.append((name, f.read()))
-    return out
-
-
-def _dedup(entries, mode):
-    vptab = collections.OrderedDict()
-    fptab = collections.OrderedDict()
-    ptab = collections.OrderedDict()
-    entry_idx = []
-    for _f, b in entries:
-        vph, fph, psh = b[0:8], b[8:16], b[16:24]
-        vs, fs_, ps = b[24:192], b[192:224], b[224:672]
-        if mode == 1:
-            vs = normalize_vp_scalar(vs)
-        vk = (vph, vs)
-        if vk not in vptab:
-            vptab[vk] = len(vptab)
-        fk = (fph, fs_)
-        if fk not in fptab:
-            fptab[fk] = len(fptab)
-        pk = (psh, ps)
-        if pk not in ptab:
-            ptab[pk] = len(ptab)
-        entry_idx.append((vptab[vk], fptab[fk], ptab[pk]))
-    return vptab, fptab, ptab, entry_idx
-
-
-def _emit_body(vptab, fptab, ptab, entry_idx, raw, mode):
-    """Serialize the BODY section (format-agnostic part of v1/v2)."""
-    out = bytearray()
-    out += struct.pack("<I", len(raw))
-    out += struct.pack("<I", 0)  # reserved (raw = whole-blob zlib)
-    for name, _data in raw:
-        nb = name.encode()
-        out += struct.pack("<I", len(nb))
-        out += nb
-        out += struct.pack("<I", len(_data))
-    raw_blob = b"".join(data for _n, data in raw)
-    raw_blob_c = zlib.compress(raw_blob, 9)
-    out += struct.pack("<I", len(raw_blob_c))
-    out += raw_blob_c
-    out += struct.pack("<B", mode)
-    out += b"\x00" * 3
-    out += struct.pack("<I", len(entry_idx))
-    out += struct.pack("<I", len(vptab))
-    out += struct.pack("<I", len(fptab))
-    out += struct.pack("<I", len(ptab))
-    for (vph, vs) in vptab:
-        out += vph + vs
-    for (fph, fs_) in fptab:
-        out += fph + fs_
-    for (psh, ps) in ptab:
-        out += psh + ps
-    for (a, c_, d) in entry_idx:
-        out += struct.pack("<III", a, c_, d)
-    return bytes(out)
-
-
-def _module_label(ppu_dir):
-    """'ppu-AAA111-GOWA.SELF' -> 'GOWA.SELF' (everything after the 2nd dash)."""
-    name = os.path.basename(os.path.abspath(ppu_dir))
-    parts = name.split("-", 2)
-    return parts[2] if len(parts) == 3 else ""
-
-
-def _pack_module(ppu_dir, mode):
-    """Pack one ppu dir (a shaders_cache tree) into a module dict + BODY bytes.
-    Returns None when the module has no entries (nothing to pack)."""
-    root, n = find_pipelines_dir(os.path.join(ppu_dir, "shaders_cache"))
-    if root is None:
+def find_split_under_ppu(ppu_dir: Path):
+    """(raw_dir, device_dir, version_dir) if <ppu_dir>/shaders_cache holds a
+    split cache, else None. Picks the highest version dir that has pipelines.bin."""
+    cache = ppu_dir / "shaders_cache"
+    if not cache.is_dir():
         return None
-    cls = os.path.basename(os.path.dirname(root))
-    ver = os.path.basename(root)
-    cache_root = _cache_root_from_pipelines(root)
-    raw_dir = _find_raw_dir(cache_root)
-    if raw_dir is None:
-        print(f"ERROR: no raw/ dir under {cache_root}")
-        sys.exit(1)
+    vulkan = cache / "pipelines" / "vulkan"
+    if not vulkan.is_dir():
+        return None
+    vdir = None
+    for d in sorted(vulkan.iterdir()):
+        if d.is_dir() and (d / "pipelines.bin").is_file():
+            vdir = d  # keep the last (highest) version
+    if vdir is None:
+        return None
+    raw_dir = cache / "raw"
+    device_dir = vdir / "device"
+    if not raw_dir.is_dir() or not device_dir.is_dir():
+        return None
+    return raw_dir, device_dir, vdir
 
-    files = sorted(f for f in os.listdir(root) if f.endswith(".bin"))
-    entries = []
-    st_ok = st_bad = 0
-    for f in files:
-        with open(os.path.join(root, f), "rb") as fh:
-            b = fh.read()
-        if len(b) != 672:
+
+def collect_split_modules(game_dir: Path):
+    """All non-empty split caches under <game_dir>/ppu-*/shaders_cache.
+    -> [ {name, ppu_dir, raw_dir, device_dir, version_dir,
+          raw_count, device_count, devices, pipeline_count}, ... ] (sorted)."""
+    mods = []
+    if not game_dir.is_dir():
+        return mods
+    for ppu in sorted(game_dir.glob("ppu-*")):
+        if not ppu.is_dir():
             continue
-        st_f = int(f[:-4].split("+")[3], 16)
-        if st_f == state_hash(b):
-            st_ok += 1
-        else:
-            st_bad += 1
-        entries.append((f, b))
-    if not entries:
-        return None  # empty module — skip
+        split = find_split_under_ppu(ppu)
+        if split is None:
+            continue
+        raw_dir, device_dir, vdir = split
+        raw_count, device_count, devices = _split_cache_stats(raw_dir, device_dir)
+        if raw_count == 0 and device_count == 0:
+            continue
+        pl = vdir / "pipelines.bin"
+        if not pl.is_file():
+            continue
+        pdata = pl.read_bytes()
+        if len(pdata) < RSPL_HEADER or struct.unpack_from("<I", pdata, 0)[0] != RSPL_MAGIC:
+            continue
+        pl_count = struct.unpack_from("<I", pdata, 8)[0]
+        mods.append({
+            "name": ppu.name,
+            "ppu_dir": ppu,
+            "raw_dir": raw_dir,
+            "device_dir": device_dir,
+            "version_dir": vdir,
+            "raw_count": raw_count,
+            "device_count": device_count,
+            "devices": devices,
+            "pipeline_count": pl_count,
+        })
+    return mods
 
-    vptab, fptab, ptab, entry_idx = _dedup(entries, mode)
-    raw = _read_raw(raw_dir)
-    body = _emit_body(vptab, fptab, ptab, entry_idx, raw, mode)
+
+def resolve_game_dir(source: Path, root: "Path | None" = None) -> Path:
+    """Locate a game dir (the dir that directly holds ppu-*/) from several inputs:
+      - a ppu-* dir        -> its parent
+      - a shaders_cache dir -> parent.parent
+      - a game dir         -> itself
+      - a gameId name      -> resolved against --root
+    Raises FileNotFoundError when nothing usable is found."""
+    cands = []
+    if source.is_dir():
+        base = source
+        if source.name.startswith("ppu-"):
+            cands.append(source.parent)
+        elif (source / "shaders_cache").is_dir():
+            cands.append(source.parent)
+        else:
+            cands.append(source)
+    if root is not None:
+        cands.append(root / source)
+        cands.append(root / source / source)  # in case source is a ppu name
+    for c in cands:
+        if c.is_dir() and any(p.is_dir() for p in c.glob("ppu-*")):
+            return c
+    raise FileNotFoundError(
+        f"no game dir with ppu-* modules found for {source} "
+        f"(pass the game dir, a ppu-* dir, or a gameId with --root)")
+
+
+# --------------------------------------------------------------------------- #
+# .rpo container
+# --------------------------------------------------------------------------- #
+def _add_entry(buf: bytearray, name: bytes, data: bytes, level: int = 9):
+    compressed = None
+    if _zstd_available() and len(data) > 256:
+        compressed = zstd.ZstdCompressor(level=level).compress(data)
+        if compressed is None or len(compressed) >= len(data):
+            compressed = None
+    payload = compressed if compressed is not None else data
+    flag = 1 if compressed is not None else 0
+    buf += name + b"\x00"
+    buf += struct.pack("<B", flag)
+    buf += struct.pack("<Q", len(data))
+    buf += struct.pack("<Q", len(payload))
+    buf += payload
+
+
+def _parse_rpo(buf: bytes):
+    """Yield (name, data) entries. Raises ValueError on any structural problem."""
+    if len(buf) < RSPO_HEADER:
+        raise ValueError("not an .rpo file (too short)")
+    if buf[:4] != RSPO_MAGIC:
+        raise ValueError("bad RSPO magic — not an .rpo file")
+    entry_count = struct.unpack_from("<I", buf, 8)[0]
+    offset = RSPO_HEADER
+    for _ in range(entry_count):
+        if offset >= len(buf):
+            raise ValueError("truncated .rpo (entry header past end)")
+        nul = buf.index(b"\x00", offset)
+        name = buf[offset:nul].decode("utf-8")
+        offset = nul + 1
+        if offset + 17 > len(buf):
+            raise ValueError(f"truncated .rpo (entry '{name}' flags)")
+        flag = buf[offset]
+        offset += 1
+        orig_len, payload_len = struct.unpack_from("<QQ", buf, offset)
+        offset += 16
+        if offset + payload_len > len(buf):
+            raise ValueError(f"truncated .rpo (entry '{name}')")
+        payload = bytes(buf[offset:offset + payload_len])
+        offset += payload_len
+        if flag:
+            if zstd is None:
+                raise ValueError(f"entry '{name}' is zstd-compressed; pip install zstandard")
+            data = zstd.ZstdDecompressor().decompress(payload, max_output_size=orig_len)
+        else:
+            data = payload
+        if len(data) != orig_len:
+            raise ValueError(f"entry '{name}': decompressed size mismatch")
+        yield name, data
+
+
+def export_game(game_dir: "Path | str", out_path: "Path | str", level: int = 9) -> dict:
+    """Pack every non-empty split module of a game into one portable .rpo."""
+    game_dir, out_path = Path(game_dir), Path(out_path)
+    mods = collect_split_modules(game_dir)
+    if not mods:
+        raise ValueError(f"no non-empty split cache found under {game_dir}")
+
+    entries = []  # (name, data)
+    manifest_modules = []
+    for m in mods:
+        sc_dir = m["ppu_dir"] / "shaders_cache"
+        # gather all source files: pipelines.bin + device props + raw shaders
+        src_files = []
+        pl = m["version_dir"] / "pipelines.bin"
+        if pl.is_file():
+            src_files.append(pl)
+        if m["device_dir"].is_dir():
+            for sub in sorted(m["device_dir"].iterdir()):
+                pf = sub / "props.bin"
+                if sub.is_dir() and pf.is_file():
+                    src_files.append(pf)
+        if m["raw_dir"].is_dir():
+            for f in sorted(m["raw_dir"].iterdir()):
+                if f.is_file():
+                    src_files.append(f)
+
+        entry_hashes = {}  # shaders_cache-relative path -> sha256
+        for f in src_files:
+            rel = os.path.relpath(f, sc_dir).replace(os.sep, "/")
+            data = f.read_bytes()
+            if rel.endswith("pipelines.bin") and (
+                    len(data) < RSPL_HEADER or struct.unpack_from("<I", data, 0)[0] != RSPL_MAGIC):
+                raise ValueError(f"{m['name']}: pipelines.bin bad RSPL magic")
+            if rel.endswith("props.bin") and (
+                    len(data) < RSPT_HEADER or struct.unpack_from("<I", data, 0)[0] != RSPT_MAGIC):
+                raise ValueError(f"{m['name']}: {rel} bad RSPT magic")
+            entries.append((f"{m['name']}/{rel}", data))
+            entry_hashes[rel] = _sha256(data)
+
+        manifest_modules.append({
+            "name": m["name"],
+            "raw_count": m["raw_count"],
+            "device_count": m["device_count"],
+            "pipeline_count": m["pipeline_count"],
+            "devices": m["devices"],
+            "sha256": entry_hashes,
+        })
+
+    manifest = {
+        "format": "rpo-split",
+        "format_version": 1,
+        "gameId": game_dir.name,
+        "module_count": len(mods),
+        "compression": "zstd" if _zstd_available() else "stored",
+        "zstd_level": level if _zstd_available() else 0,
+        "modules": manifest_modules,
+    }
+    manifest_json = json.dumps(manifest, indent=2).encode("utf-8")
+
+    buf = bytearray()
+    buf += RSPO_MAGIC
+    buf += struct.pack("<I", 1)  # format version
+    buf += struct.pack("<I", 1 + len(entries))  # entry count (manifest + modules)
+    _add_entry(buf, b"manifest.json", manifest_json, level)
+    for name, data in entries:
+        _add_entry(buf, name.encode("utf-8"), data, level)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(bytes(buf))
+
+    size_in = 0
+    for m in mods:
+        size_in += _tree_bytes(m["raw_dir"])
+        size_in += _tree_bytes(m["device_dir"])
+        pl = m["version_dir"] / "pipelines.bin"
+        if pl.is_file():
+            size_in += pl.stat().st_size
     return {
-        "name": os.path.basename(os.path.abspath(ppu_dir)),
-        "label": _module_label(ppu_dir),
-        "cls": cls,
-        "ver": ver,
-        "entries": len(entries),
-        "raw": len(raw),
-        "body": body,
-        "st_ok": st_ok,
-        "st_bad": st_bad,
+        "gameId": game_dir.name,
+        "module_count": len(mods),
+        "modules": [m["name"] for m in mods],
+        "raw_count": sum(m["raw_count"] for m in mods),
+        "device_count": sum(m["device_count"] for m in mods),
+        "pipeline_count": sum(m["pipeline_count"] for m in mods),
+        "compressed": _zstd_available(),
+        "size_in": size_in,
+        "size_out": out_path.stat().st_size,
     }
 
 
-def _find_modules(cache_path):
-    """Accepts a game dir (<GAMEID> with ppu-* children) or a single ppu dir.
-    -> (game_id, [ppu_dir, ...]) sorted."""
-    cache_path = os.path.abspath(cache_path)
-    if os.path.isdir(os.path.join(cache_path, "shaders_cache")):
-        game_id = os.path.basename(os.path.dirname(cache_path))
-        if game_id.lower() == "cache":
-            game_id = "UNKNOWN"
-        return game_id, [cache_path]
-    modules = []
-    if os.path.isdir(cache_path):
-        for sub in sorted(os.listdir(cache_path)):
-            d = os.path.join(cache_path, sub)
-            if sub.startswith("ppu-") and os.path.isdir(os.path.join(d, "shaders_cache")):
-                modules.append(d)
-    return os.path.basename(cache_path), modules
+def _tree_bytes(root: Path) -> int:
+    total = 0
+    if root.is_dir():
+        for p in root.rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+    return total
 
 
-def cmd_pack(args):
-    game_id, ppu_dirs = _find_modules(args.cache)
-    if not ppu_dirs:
-        print("ERROR: no ppu-*/shaders_cache dirs under", args.cache)
-        sys.exit(1)
-    if not args.out:
-        args.out = game_id + ".rsca"
-
-    mode = 1 if args.mode == "normalized" else 0
-    packed, skipped = [], []
-    for d in ppu_dirs:
-        m = _pack_module(d, mode)
-        if m is None:
-            skipped.append(os.path.basename(d))
+def unpack_game(in_path: "Path | str", target: "Path | str", ppu_name: "str | None" = None) -> dict:
+    """Unpack a .rpo into a fork-ready tree.
+    target may be:
+      - a data dir  (contains cache/<gameId>/) -> unpack under cache/<gameId>/
+      - a game dir  (contains ppu-*/)          -> unpack under it directly
+      - a ppu dir   (ppu-*)                    -> unpack under its shaders_cache
+    Returns {gameId, modules:[{name, files, bytes}], target_root}."""
+    in_path, target = Path(in_path), Path(target)
+    buf = in_path.read_bytes()
+    manifest = None
+    entries = {}
+    for name, data in _parse_rpo(buf):
+        if name == "manifest.json":
+            manifest = json.loads(data.decode("utf-8"))
         else:
-            packed.append(m)
-    if not packed:
-        print("ERROR: no module with entries found under", args.cache)
-        sys.exit(1)
+            entries[name] = data
+    if manifest is None:
+        raise ValueError("missing manifest.json — not a valid .rpo")
+    game_id = manifest.get("gameId", "UNKNOWN")
 
-    out = bytearray()
-    out += MAGIC
-    out += struct.pack("<I", FORMAT)
-    out += game_id.encode().ljust(16, b"\x00")[:16]
-    out += struct.pack("<I", len(packed))
-    for m in packed:
-        nb = m["name"].encode()
-        out += struct.pack("<I", len(nb))
-        out += nb
-        out += m["cls"].encode().ljust(16, b"\x00")[:16]
-        out += m["ver"].encode().ljust(16, b"\x00")[:16]
-        out += m["body"]
-
-    with open(args.out, "wb") as fh:
-        fh.write(bytes(out))
-    print(f"game_id   : {game_id}")
-    print(f"format    : RSCA v2, {len(packed)} module(s)"
-          + (f", skipped empty: {', '.join(skipped)}" if skipped else ""))
-    for m in packed:
-        print(f"  - {m['label'] or m['name']}: {m['entries']} entries, "
-              f"{m['raw']} raw, {m['cls']}/{m['ver']} "
-              f"(state_hash {m['st_ok']} OK, {m['st_bad']} BAD)")
-    print(f"packed    : {len(out):,} B ({len(out)/1024/1024:.2f} MB) -> {args.out}")
-
-
-# ---------------------------------------------------------------------------
-# parsing
-# ---------------------------------------------------------------------------
-def _parse_body(data, off):
-    """Parse a BODY section at off. -> (mode, raw, vptab, fptab, ptab, ent, new_off)."""
-    raw_count = u32(data, off)
-    off += 8  # raw_count + reserved
-    raw_index = []
-    for _ in range(raw_count):
-        nlen = u32(data, off)
-        off += 4
-        name = data[off:off + nlen].decode()
-        off += nlen
-        dlen = u32(data, off)
-        off += 4
-        raw_index.append((name, dlen))
-    blob_c_len = u32(data, off)
-    off += 4
-    raw_blob = zlib.decompress(data[off:off + blob_c_len])
-    off += blob_c_len
-    raw = []
-    pos = 0
-    for name, dlen in raw_index:
-        raw.append((name, raw_blob[pos:pos + dlen]))
-        pos += dlen
-    if pos != len(raw_blob):
-        raise ValueError(f"raw split mismatch {pos} != {len(raw_blob)}")
-    mode = data[off]
-    off += 4
-    N = u32(data, off)
-    off += 4
-    Uvp = u32(data, off)
-    off += 4
-    Ufp = u32(data, off)
-    off += 4
-    Upr = u32(data, off)
-    off += 4
-    vptab = []
-    for _ in range(Uvp):
-        vph = data[off:off + 8]
-        vs = data[off + 8:off + 8 + VP_SCAL]
-        off += 8 + VP_SCAL
-        vptab.append((vph, vs))
-    fptab = []
-    for _ in range(Ufp):
-        fph = data[off:off + 8]
-        fs_ = data[off + 8:off + 8 + FP_SCAL]
-        off += 8 + FP_SCAL
-        fptab.append((fph, fs_))
-    ptab = []
-    for _ in range(Upr):
-        psh = data[off:off + 8]
-        ps = data[off + 8:off + 8 + PROPS]
-        off += 8 + PROPS
-        ptab.append((psh, ps))
-    ent = []
-    for _ in range(N):
-        a, c_, d = struct.unpack_from("<III", data, off)
-        off += 12
-        ent.append((a, c_, d))
-    return mode, raw, vptab, fptab, ptab, ent, off
-
-
-def parse_pack(data):
-    """Parse an RSCA v1 or v2 file.
-    -> {"version", "game_id", "modules": [
-         {"name" ("": legacy v1), "cls", "ver", "mode",
-          "raw", "vptab", "fptab", "ptab", "ent"}]}"""
-    if data[0:4] != MAGIC:
-        raise ValueError("bad magic (not RSCA)")
-    fmt = struct.unpack_from("<I", data, 4)[0]
-    game_id = data[8:24].rstrip(b"\x00").decode()
-    if fmt == FORMAT_V1:
-        cls = data[24:40].rstrip(b"\x00").decode()
-        ver = data[40:56].rstrip(b"\x00").decode()
-        mode, raw, vptab, fptab, ptab, ent, off = _parse_body(data, 56)
-        if off != len(data):
-            raise ValueError(f"trailing bytes: {len(data) - off}")
-        modules = [{"name": "", "cls": cls, "ver": ver, "mode": mode,
-                    "raw": raw, "vptab": vptab, "fptab": fptab, "ptab": ptab, "ent": ent}]
-        return {"version": fmt, "game_id": game_id, "modules": modules}
-    if fmt != FORMAT:
-        raise ValueError(f"unsupported format {fmt}")
-    mcount = u32(data, 24)
-    off = 28
-    modules = []
-    for _ in range(mcount):
-        nlen = u32(data, off)
-        off += 4
-        name = data[off:off + nlen].decode()
-        off += nlen
-        cls = data[off:off + 16].rstrip(b"\x00").decode()
-        off += 16
-        ver = data[off:off + 16].rstrip(b"\x00").decode()
-        off += 16
-        mode, raw, vptab, fptab, ptab, ent, off = _parse_body(data, off)
-        modules.append({"name": name, "cls": cls, "ver": ver, "mode": mode,
-                        "raw": raw, "vptab": vptab, "fptab": fptab, "ptab": ptab,
-                        "ent": ent})
-    if off != len(data):
-        raise ValueError(f"trailing bytes: {len(data) - off}")
-    return {"version": fmt, "game_id": game_id, "modules": modules}
-
-
-def list_modules(path):
-    """Summary of the modules inside an RSCA file (for menus/diagnostics)."""
-    with open(path, "rb") as f:
-        data = f.read()
-    p = parse_pack(data)
-    out = []
-    for m in p["modules"]:
-        out.append({"name": m["name"], "label": _module_label(m["name"]) if m["name"] else "(v1 legacy)",
-                    "cls": m["cls"], "ver": m["ver"],
-                    "entries": len(m["ent"]), "raw": len(m["raw"])})
-    return {"version": p["version"], "game_id": p["game_id"], "modules": out}
-
-
-def _entry_bytes(vptab, fptab, ptab, a, c_, d):
-    vph, vs = vptab[a]
-    fph, fs_ = fptab[c_]
-    psh, ps = ptab[d]
-    e = vph + fph + psh + vs + fs_ + ps
-    assert len(e) == 672, f"entry len {len(e)}"
-    return e
-
-
-def _entry_name(e):
-    st = state_hash(e)
-    return f"{u64(e, 0):X}+{u64(e, 8):X}+{u64(e, 16):X}+{st:X}.bin"
-
-
-def _write_module_to(m, root, overwrite=False):
-    """Write one parsed module under <root>/shaders_cache. Returns (raw_added,
-    raw_present, ent_added, ent_present)."""
-    raw_dir = os.path.join(root, "shaders_cache", "raw")
-    target = os.path.join(root, "shaders_cache", "pipelines", m["cls"], m["ver"])
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(target, exist_ok=True)
-    ra = rs = ea = es = 0
-    for name, d in m["raw"]:
-        p = os.path.join(raw_dir, name)
-        if os.path.exists(p) and not overwrite:
-            rs += 1
-        else:
-            open(p, "wb").write(d)
-            ra += 1
-    for (a, c_, d) in m["ent"]:
-        e = _entry_bytes(m["vptab"], m["fptab"], m["ptab"], a, c_, d)
-        p = os.path.join(target, _entry_name(e))
-        if os.path.exists(p) and not overwrite:
-            es += 1
-        else:
-            open(p, "wb").write(e)
-            ea += 1
-    return ra, rs, ea, es
-
-
-# ---------------------------------------------------------------------------
-# unpack / merge
-# ---------------------------------------------------------------------------
-def _ppu_dirs_under(d):
-    """ppu-* dirs (sorted) that contain a shaders_cache, under dir d."""
-    if not os.path.isdir(d):
-        return []
-    out = []
-    for sub in sorted(os.listdir(d)):
-        p = os.path.join(d, sub)
-        if sub.startswith("ppu-") and os.path.isdir(os.path.join(p, "shaders_cache")):
-            out.append(p)
-    return out
-
-
-def _count_entries(p):
-    """Number of .bin pipeline files in a version dir (0 when absent)."""
-    if not os.path.isdir(p):
-        return 0
-    return sum(1 for f in os.listdir(p) if f.endswith(".bin"))
-
-
-def _match_ppu(target, name, label):
-    """Find the ppu dir on this machine for a module from the file:
-    exact name first, then by module label (suffix after the 2nd dash)."""
-    dirs = _ppu_dirs_under(target)
-    for d in dirs:
-        if os.path.basename(d) == name:
-            return d
-    for d in dirs:
-        if label and _module_label(d) == label:
-            return d
-    return None
-
-
-def cmd_unpack(args):
-    with open(args.pack, "rb") as f:
-        data = f.read()
-    p = parse_pack(data)
-    for m in p["modules"]:
-        if m["name"]:
-            root = os.path.join(args.target, m["name"])
-        else:
-            root = args.target  # v1 legacy: write directly under --target
-        ra, _rs, ea, _es = _write_module_to(m, root, overwrite=True)
-        lbl = _module_label(m["name"]) if m["name"] else "(v1 legacy)"
-        print(f"game_id   : {p['game_id']}  (RSCA v{p['version']})")
-        print(f"module    : {lbl} {m['cls']}/{m['ver']}")
-        print(f"raw files : {ra} -> {os.path.join(root, 'shaders_cache', 'raw')}")
-        print(f"entries   : {ea} -> {os.path.join(root, 'shaders_cache', 'pipelines', m['cls'], m['ver'])}")
-        print(f"mode      : {'normalized' if m['mode'] else 'byte-exact'}")
-
-
-def cmd_merge(args):
-    """Union an RSCA file into an existing cache.
-    --target: the game dir (<GAMEID> with ppu-* children) or a single ppu dir.
-    v1 files: the first usable ppu dir under the target (legacy behavior).
-    v2 files: each module is matched to a local ppu dir by name/label."""
-    with open(args.pack, "rb") as f:
-        data = f.read()
-    p = parse_pack(data)
-    target = os.path.abspath(args.target)
-
-    missing = []
-    if p["version"] == FORMAT_V1:
-        if os.path.isdir(os.path.join(target, "shaders_cache")):
-            pairs = [(m, target) for m in p["modules"]]
-        else:
-            dirs = _ppu_dirs_under(target)
-            if not dirs:
-                print("ERROR: no ppu-*/shaders_cache dir under", target)
-                sys.exit(1)
-            m = p["modules"][0]
-            if len(dirs) == 1:
-                choice = dirs[0]
-            else:
-                # v1 files don't record the module name — pick the ppu dir whose
-                # entry count is closest to the file's (a cache only grows)
-                file_n = len(m["ent"])
-                scored = sorted(
-                    (abs(_count_entries(os.path.join(d, "shaders_cache", "pipelines", m["cls"], m["ver"])) - file_n),
-                     _count_entries(os.path.join(d, "shaders_cache", "pipelines", m["cls"], m["ver"])), d)
-                    for d in dirs)
-                if scored[1][0] == scored[0][0]:
-                    print(f"ERROR: v1 file has no module name and {target} has several ppu dirs — "
-                          f"pass --ppu DIR to choose:")
-                    for _s, n, d in scored:
-                        print(f"  - {os.path.basename(d)} ({n} entries)")
-                    sys.exit(1)
-                choice = scored[0][2]
-            pairs = [(m, choice) for m in p["modules"]]
-    elif os.path.isdir(os.path.join(target, "shaders_cache")):
-        if len(p["modules"]) == 1:
-            pairs = [(p["modules"][0], target)]
-        else:
-            print(f"ERROR: target is a single ppu dir but the file has "
-                  f"{len(p['modules'])} modules — pass the game dir")
-            sys.exit(1)
+    # Decide the base dir that directly holds ppu-* modules.
+    if ppu_name is not None:
+        # single explicit ppu: everything goes under <target>/<ppu_name>/shaders_cache
+        base = target
+    elif (target / "cache").is_dir():
+        base = target / "cache" / game_id
+    elif any(p.is_dir() for p in target.glob("ppu-*")):
+        base = target
+    elif (target / game_id).is_dir() and any(p.is_dir() for p in (target / game_id).glob("ppu-*")):
+        base = target / game_id
     else:
-        pairs = []
-        missing = []
-        for m in p["modules"]:
-            d = _match_ppu(target, m["name"], _module_label(m["name"]))
-            if d:
-                pairs.append((m, d))
-            else:
-                missing.append(m)
+        # default: treat target as a data dir
+        base = target / "cache" / game_id
 
-    print(f"game_id : {p['game_id']}  (RSCA v{p['version']})")
-    for m, d in pairs:
-        ra, rs, ea, es = _write_module_to(m, d, overwrite=args.overwrite)
-        lbl = _module_label(m["name"]) if m["name"] else "(v1 legacy)"
-        print(f"  {lbl}: {ea} entries added, {es} present; "
-              f"{ra} raw added, {rs} present  -> {d}")
-    if missing:
-        for m in missing:
-            lbl = _module_label(m["name"])
-            print(f"  {lbl or m['name']}: NOT IMPORTED — no matching ppu-* dir for {p['game_id']} "
-                  f"under {target}")
-        print("  -> launch that game once in RPCS3 (it creates the dir), then re-run")
-        sys.exit(1)
+    written = 0
+    bytes_written = 0
+    module_report = []
+    for mod in manifest.get("modules", []):
+        mname = mod["name"]
+        prefix = f"{mname}/"
+        target_ppu = base / mname / "shaders_cache"
+        files = 0
+        for name, data in entries.items():
+            if not name.startswith(prefix):
+                continue
+            rel = name[len(prefix):]
+            dest = target_ppu / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            files += 1
+            bytes_written += len(data)
+            written += 1
+        module_report.append({"name": mname, "files": files,
+                              "raw_count": mod.get("raw_count", 0),
+                              "device_count": mod.get("device_count", 0)})
+    return {
+        "gameId": game_id,
+        "base": str(base),
+        "modules": module_report,
+        "files": written,
+        "bytes": bytes_written,
+    }
+
+
+def list_rpo(in_path: "Path | str"):
+    in_path = Path(in_path)
+    buf = in_path.read_bytes()
+    manifest = None
+    rows = []
+    for name, data in _parse_rpo(buf):
+        if name == "manifest.json":
+            manifest = json.loads(data.decode("utf-8"))
+        else:
+            rows.append({"name": name, "size": len(data)})
+    return manifest, rows
+
+
+def verify_rpo(in_path: "Path | str") -> dict:
+    in_path = Path(in_path)
+    buf = in_path.read_bytes()
+    entries = {}
+    manifest = None
+    for name, data in _parse_rpo(buf):
+        if name == "manifest.json":
+            manifest = json.loads(data.decode("utf-8"))
+        else:
+            entries[name] = data
+    if manifest is None:
+        return {"ok": False, "error": "missing manifest.json"}
+    mods = manifest.get("modules", [])
+    if not mods:
+        return {"ok": False, "error": "no modules in manifest"}
+    for mod in mods:
+        mname = mod["name"]
+        sha = mod.get("sha256", {})
+        rels = list(sha.keys())
+        if not any(r.endswith("pipelines.bin") for r in rels):
+            return {"ok": False, "error": f"module {mname}: missing pipelines.bin"}
+        if not any(r.startswith("raw/") for r in rels):
+            return {"ok": False, "error": f"module {mname}: missing raw shaders"}
+        if not any(r.endswith("props.bin") for r in rels):
+            return {"ok": False, "error": f"module {mname}: missing device props"}
+        for rel, expect in sha.items():
+            n = f"{mname}/{rel}"
+            if n not in entries:
+                return {"ok": False, "error": f"module {mname}: missing {rel}"}
+            if _sha256(entries[n]) != expect:
+                return {"ok": False, "error": f"module {mname}: {rel} checksum mismatch"}
+    return {"ok": True, "gameId": manifest.get("gameId"),
+            "modules": len(mods), "entries": len(entries)}
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RPCS3 shader-cache RSCA packer/extractor.")
+    ap = argparse.ArgumentParser(description="RPCS3 fork split-cache toolkit (.rpo)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    v = sub.add_parser("verify", help="compare two pipeline dirs (byte-for-byte)")
-    v.add_argument("orig")
-    v.add_argument("restored")
-    p = sub.add_parser("pack", help="game dir (all non-empty ppu modules) or one ppu dir -> <GAMEID>.rsca")
-    p.add_argument("cache")
-    p.add_argument("-o", "--out", default=None, help="output file (default: <game-id>.rsca)")
-    p.add_argument("--game-id", default=None, help="override the game id in the header")
-    p.add_argument("--mode", default="byte-exact", choices=["byte-exact", "normalized"])
-    u = sub.add_parser("unpack", help="RSCA file -> dir(s) with shaders_cache/")
-    u.add_argument("pack")
-    u.add_argument("--target", required=True, help="dir to write under (one subdir per module for v2)")
-    l = sub.add_parser("list", help="list the modules inside an RSCA file")
-    l.add_argument("pack")
-    m = sub.add_parser("merge", help="union an RSCA file into an existing game/ppu cache dir")
-    m.add_argument("pack")
-    m.add_argument("--target", required=True, help="game dir (<GAMEID>) or a ppu-* dir")
-    m.add_argument("--overwrite", action="store_true", help="rewrite files even if present")
+
+    p_exp = sub.add_parser("export", help="pack a game's split cache into one .rpo")
+    p_exp.add_argument("source", help="gameId, game dir, or ppu-* dir")
+    p_exp.add_argument("output", help="output .rpo path")
+    p_exp.add_argument("--root", default=None, help="data dir (when source is a gameId)")
+    p_exp.add_argument("--level", type=int, default=9, help="zstd level (1-22)")
+
+    p_un = sub.add_parser("unpack", help="unpack a .rpo into a fork-ready tree")
+    p_un.add_argument("input", help=".rpo file")
+    p_un.add_argument("output", help="data dir, game dir, or ppu dir")
+    p_un.add_argument("--ppu", default=None, help="force a single ppu-* target name")
+
+    p_li = sub.add_parser("list", help="list a .rpo's modules and entries")
+    p_li.add_argument("input", help=".rpo file")
+
+    p_ver = sub.add_parser("verify", help="verify a .rpo (structure + checksums)")
+    p_ver.add_argument("input", help=".rpo file")
+
     args = ap.parse_args()
 
-    if args.cmd == "verify":
-        cmd_verify(args)
-    elif args.cmd == "pack":
-        cmd_pack(args)
-    elif args.cmd == "unpack":
-        cmd_unpack(args)
-    elif args.cmd == "list":
-        info = list_modules(args.pack)
-        print(f"game    : {info['game_id']}   (RSCA v{info['version']})")
-        for m in info["modules"]:
-            print(f"  - {m['label']}: {m['entries']} entries, {m['raw']} raw, {m['cls']}/{m['ver']}")
-    elif args.cmd == "merge":
-        cmd_merge(args)
-
-
-def cmd_verify(args):
-    a = sorted(f for f in os.listdir(args.orig) if f.endswith(".bin"))
-    b = sorted(f for f in os.listdir(args.restored) if f.endswith(".bin"))
-    sa, sb = set(a), set(b)
-    only_a, only_b = sa - sb, sb - sa
-    common = sa & sb
-    identical = diff = 0
-    diff_details = []
-    for f in sorted(common):
-        A = open(os.path.join(args.orig, f), "rb").read()
-        B = open(os.path.join(args.restored, f), "rb").read()
-        if len(A) != len(B) or A != B:
-            diff += 1
-            if len(diff_details) < 3:
-                if len(A) == len(B):
-                    diffs = [i for i in range(len(A)) if A[i] != B[i]]
-                    diff_details.append((f, diffs[:8], "..." if len(diffs) > 8 else ""))
-                else:
-                    diff_details.append((f, "len", f"{len(A)} vs {len(B)}"))
+    if args.cmd == "export":
+        root = Path(args.root) if args.root else None
+        game_dir = resolve_game_dir(Path(args.source), root)
+        info = export_game(game_dir, Path(args.output), args.level)
+        print(f"exported {info['gameId']} — {info['module_count']} module(s): "
+              f"{', '.join(info['modules'])}")
+        print(f"  {info['raw_count']} raw / {info['device_count']} device entries, "
+              f"{info['pipeline_count']} pipeline records")
+        if info["compressed"]:
+            ratio = info["size_in"] / info["size_out"] if info["size_out"] else 1
+            print(f"  {info['size_in']/1048576:.1f} MiB -> {info['size_out']/1048576:.1f} MiB "
+                  f"({ratio:.1f}x, zstd L{args.level})")
         else:
-            identical += 1
-    print(f"orig files      : {len(a)}")
-    print(f"restored files  : {len(b)}")
-    print(f"only in orig    : {len(only_a)}")
-    print(f"only in restored: {len(only_b)}")
-    print(f"common          : {len(common)}")
-    print(f"byte-identical  : {identical}")
-    print(f"differing       : {diff}")
-    for d in diff_details:
-        print("   DIFF:", d)
-    if diff == 0 and not only_a and not only_b:
-        print("RESULT: PERFECT ROUND-TRIP (byte-for-byte identical)")
-    else:
-        print("RESULT: NOT byte-identical (see above)")
+            print("  warning: zstandard not installed — .rpo is uncompressed (pip install zstandard)")
+    elif args.cmd == "unpack":
+        res = unpack_game(Path(args.input), Path(args.output), args.ppu)
+        print(f"unpacked {res['gameId']} — {res['files']} files, "
+              f"{res['bytes']/1048576:.1f} MiB -> {res['base']}")
+        for m in res["modules"]:
+            print(f"  {m['name']}  ({m['files']} files, {m['raw_count']} raw, "
+                  f"{m['device_count']} device)")
+    elif args.cmd == "list":
+        manifest, rows = list_rpo(Path(args.input))
+        if manifest:
+            print(f"{manifest.get('gameId')} — {manifest.get('module_count')} module(s), "
+                  f"{manifest.get('compression') or 'stored'}")
+            for mod in manifest.get("modules", []):
+                print(f"  module {mod['name']}: {mod['raw_count']} raw, "
+                      f"{mod['device_count']} device, {mod['pipeline_count']} pipeline")
+                for d in mod.get("devices", []):
+                    print(f"      device {d['key']}: {d['count']} entries, {d['size']/1048576:.2f} MiB")
+        print(f"  {len(rows)} .rpo entries total")
+    elif args.cmd == "verify":
+        res = verify_rpo(Path(args.input))
+        if res["ok"]:
+            print(f"OK — {res['gameId']}, {res['modules']} module(s), {res['entries']} entries, "
+                  f"structure + checksums valid")
+        else:
+            print(f"FAIL — {res.get('error')}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

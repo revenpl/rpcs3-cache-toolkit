@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
-"""cache_tool.py — interactive RPCS3 shader-cache manager (RSCA v2).
+"""cache_tool.py — interactive RPCS3 FORK shader-cache manager (split format).
+
+Targets the fork's SPLIT cache format only (the legacy ".rsca" tar.gz format
+is gone — this is an exporter for the fork, so it speaks the fork's native
+layout):
+
+    <data>/cache/<GAMEID>/ppu-<hash>-<SELF>/shaders_cache/
+        raw/<HASH>.vp | <HASH>.fp
+        pipelines/vulkan/<version>/pipelines.bin
+        pipelines/vulkan/<version>/device/<KEY>/props.bin
 
 Flow: auto-discover the RPCS3 data dir (Windows / Linux / macOS)
-      -> choose operation: add a cache (import .rsca) or export a game
-      -> choose the GAME (not the module — modules are handled automatically).
+      -> choose operation: import a .rpo (add a cache) or export a game
+      -> choose the GAME (modules are handled automatically).
 
-A game dir (<data>/cache/<GAMEID>/) holds one shaders_cache per PPU module
-(EBOOT.BIN, GOWA.SELF, coo.ppu.self, ...). A collection title has one module
-per playable game. Export therefore packs ALL non-empty modules of a game
-into one <GAMEID>.rsca (RSCA v2); import matches each module to the
-local ppu-* dir by name automatically (v1 legacy files still import).
+A game dir holds one split cache per PPU module (EBOOT.BIN, GOWA.SELF, ...).
+Export packs ALL split modules of a game into one <GAMEID>.rpo; import
+unpacks a .rpo and matches each module to the local ppu-* dir by name.
+All format logic lives in opt_cache.py.
 
-Import picks a .rsca file from the program folder (next to this script) and
-merges it into the local cache (idempotent union, via opt_cache.cmd_merge).
-Export packs the game's cache into <out>/<GAMEID>.rsca. All format logic
-lives in opt_cache.py.
-
-Python 3, stdlib only.
+Python 3, stdlib only (+ zstandard for compression, optional).
 
 Non-interactive (for scripting):
   cache_tool.py discover
   cache_tool.py list
-  cache_tool.py import  FILE [--data DIR] [--ppu DIR]
-  cache_tool.py export  [--game BCES01741] [--ppu DIR] [--out DIR]
+  cache_tool.py import  FILE.rpo [--data DIR] [--ppu NAME]
+  cache_tool.py export  [--game BCES01741] [--data DIR] [--out DIR]
 """
 import os
+import struct
 import sys
-import types
-import hashlib
 import argparse
+from pathlib import Path
 
 PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROGRAM_DIR)
@@ -42,11 +45,7 @@ SKIP = {".git", "node_modules", ".npm", ".venv", "venv", ".cargo", ".rustup",
 
 def candidate_data_dirs(home, env):
     """Platform data-dir candidates (dir containing cache/<GAMEID>/...), most likely first.
-    Mirrors RPCS3's own logic (Utilities/File.cpp fs::get_cache_dir):
-      Windows: $RPCS3_CONFIG_DIR, then common install spots (data lives next to rpcs3.exe)
-      macOS  : $HOME/Library/Caches/rpcs3
-      Linux  : $XDG_CACHE_HOME else $XDG_CONFIG_HOME else $HOME/.cache, + /rpcs3
-    Returns a plain list; existence is NOT checked here (caller validates by content)."""
+    Mirrors RPCS3's own logic (Utilities/File.cpp fs::get_cache_dir)."""
     out = []
 
     def add(p):
@@ -60,27 +59,23 @@ def candidate_data_dirs(home, env):
         add(os.path.join(env.get("ProgramFiles") or "C:/Program Files", "rpcs3"))
     elif sys.platform == "darwin":
         add(os.path.join(home, "Library", "Caches", "rpcs3"))
+        add(os.path.join(home, "Library", "Application Support", "rpcs3"))
         add(os.path.join(home, "rpcs3"))
     else:
         add(os.path.join(env.get("XDG_CACHE_HOME") or os.path.join(home, ".cache"), "rpcs3"))
         add(os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "rpcs3"))
         add(os.path.join(home, ".local", "share", "rpcs3"))
-        # Flatpak (XDG dirs inside the sandbox)
         add(os.path.join(home, ".var", "app", "net.rpcs3.RPCS3", ".cache", "rpcs3"))
         add(os.path.join(home, ".var", "app", "net.rpcs3.RPCS3", ".local", "share", "rpcs3"))
         add(os.path.join(home, "rpcs3"))
     return out
 
 
-def _count_bins(pipelines_dir):
-    return sum(len([f for f in files if f.endswith(".bin")])
-               for _r, _d, files in os.walk(pipelines_dir))
-
-
 def find_shader_caches(data_dir, max_depth=8):
-    """Usable shader caches under <data_dir>/cache/: a 'shaders_cache' dir with
-    raw/ AND pipelines/. Returns sorted list of dicts:
-      {game_id, ppu_dir, sc (the shaders_cache path), entries (count of .bin)}"""
+    """VALID split shader caches under <data_dir>/cache/.
+    -> sorted [{game_id, ppu_dir, sc, entries, raw_count, device_count, version}, ...].
+    'entries' = pipeline (RSPL) record count. Only split caches are listed —
+    legacy (per-entry .bin) dirs are ignored."""
     base = os.path.join(data_dir, "cache")
     trees = []
     if not os.path.isdir(base):
@@ -96,12 +91,26 @@ def find_shader_caches(data_dir, max_depth=8):
                 and os.path.isdir(os.path.join(dirpath, "pipelines"))):
             sc = dirpath
             ppu = os.path.dirname(sc)
-            trees.append({
-                "game_id": os.path.basename(os.path.dirname(ppu)),
-                "ppu_dir": ppu,
-                "sc": sc,
-                "entries": _count_bins(os.path.join(sc, "pipelines")),
-            })
+            split = opt_cache.find_split_under_ppu(Path(ppu))
+            if split is not None:
+                raw_dir, device_dir, vdir = split
+                _rc, device_count, _devs = opt_cache._split_cache_stats(raw_dir, device_dir)
+                raw_count = opt_cache._count_files(raw_dir)
+                pl = vdir / "pipelines.bin"
+                entries = 0
+                if pl.is_file():
+                    d = pl.read_bytes()
+                    if len(d) >= 16:
+                        entries = struct.unpack_from("<I", d, 8)[0]
+                trees.append({
+                    "game_id": os.path.basename(os.path.dirname(ppu)),
+                    "ppu_dir": ppu,
+                    "sc": sc,
+                    "entries": entries,
+                    "raw_count": raw_count,
+                    "device_count": device_count,
+                    "version": vdir.name,
+                })
             dirnames[:] = []  # never descend into a shaders_cache
         else:
             dirnames[:] = [d for d in dirnames if d not in SKIP]
@@ -110,8 +119,7 @@ def find_shader_caches(data_dir, max_depth=8):
 
 def search_hits(root, max_depth=5):
     """Bounded walk from root. A hit = a dir whose child 'cache/' contains a usable
-    shaders_cache (RPCS3 always stores them under <data>/cache/). Returns
-    [(data_dir, [trees]), ...] in discovery order."""
+    split shaders_cache. Returns [(data_dir, [trees]), ...] in discovery order."""
     hits = []
     seen = set()
     if not os.path.isdir(root):
@@ -130,14 +138,12 @@ def search_hits(root, max_depth=5):
                 if d not in seen:
                     seen.add(d)
                     hits.append((d, trees))
-                dirnames[:] = []  # don't descend further through a confirmed hit
+                dirnames[:] = []
     return hits
 
 
 def discover(home=None, env=None):
-    """-> (data_dir | None, [trees]). Pass 1: platform candidates (first one that
-    actually contains a usable cache wins). Pass 2: bounded search from home and
-    Windows common roots. (None, []) when nothing found."""
+    """-> (data_dir | None, [trees]). (None, []) when nothing found."""
     home = home or os.path.expanduser("~")
     env = dict(env) if env is not None else dict(os.environ)
     for cand in candidate_data_dirs(home, env):
@@ -164,49 +170,25 @@ def group_games(trees):
     return games
 
 
-def _sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def scan_raw(sc):
-    """All shader binaries under <sc>/raw/ (real layout: <HASH>.vp / <HASH>.fp),
-    sorted by filename. -> [{path, size, sha256}, ...]"""
-    raws = []
-    raw_dir = os.path.join(sc, "raw")
-    if not os.path.isdir(raw_dir):
-        return raws
-    for name in sorted(os.listdir(raw_dir)):
-        p = os.path.join(raw_dir, name)
-        if os.path.isfile(p):
-            raws.append({"path": p, "size": os.path.getsize(p), "sha256": _sha256_file(p)})
-    return raws
-
-
-def list_rsca_files(program_dir):
+# --- .rpo helpers (delegate to opt_cache) ---
+def list_rpo_files(program_dir):
     if not os.path.isdir(program_dir):
         return []
-    return sorted(f for f in os.listdir(program_dir) if f.lower().endswith(".rsca"))
+    return sorted(f for f in os.listdir(program_dir) if f.lower().endswith(".rpo"))
 
 
-def read_rsca_game_id(path):
-    """Game id from the RSCA header (bytes 8..23) — same offset in v1 and v2."""
-    with open(path, "rb") as f:
-        head = f.read(24)
-    if len(head) < 24 or head[:4] != opt_cache.MAGIC:
-        raise ValueError(f"not an RSCA file: {path}")
-    return head[8:24].rstrip(b"\x00").decode()
+def rpo_game_id(path):
+    manifest, _ = opt_cache.list_rpo(Path(path))
+    if manifest is None:
+        raise ValueError(f"not an .rpo file (no manifest): {path}")
+    return manifest.get("gameId")
 
 
-def rsca_modules(path):
-    """Module summary of an RSCA file (v1 or v2) — for menus and diagnostics."""
-    try:
-        return opt_cache.list_modules(path)
-    except (ValueError, OSError):
-        return {"version": 0, "game_id": "?", "modules": []}
+def rpo_info(path):
+    manifest, _rows = opt_cache.list_rpo(Path(path))
+    if manifest is None:
+        raise ValueError(f"not an .rpo file (no manifest): {path}")
+    return manifest
 
 
 def game_dir_for(data_dir, game_id):
@@ -220,47 +202,35 @@ def game_dir_for(data_dir, game_id):
     return None
 
 
-def do_import(rsca_path, data_dir, ppu_dir=None):
-    """Merge .rsca into the local cache (idempotent union).
-    v2 files: each module is matched to a local ppu-* dir automatically.
-    v1 files: merged into the first ppu dir of the game (or --ppu dir).
-    Returns a summary line. Raises FileNotFoundError when the game has no
-    ppu-* dir yet (must be launched once)."""
-    game = read_rsca_game_id(rsca_path)
-    if ppu_dir is not None:
-        target = ppu_dir
-    else:
-        target = game_dir_for(data_dir, game)
-        if target is None or not opt_cache._ppu_dirs_under(target):
-            raise FileNotFoundError(
-                f"no ppu-* cache dir for {game} under {os.path.join(data_dir, 'cache')}\n"
-                f"  -> launch the game once in RPCS3 (it creates the dir), then re-run,\n"
-                f"  or pass --ppu DIR explicitly.")
-    opt_cache.cmd_merge(types.SimpleNamespace(pack=rsca_path, target=target, overwrite=False))
-    return target
+def do_export_game(data_dir, game_id, out_dir, level=9):
+    """Pack ALL split modules of a game into <out_dir>/<GAMEID>.rpo.
+    Returns (out_path, info)."""
+    os.makedirs(out_dir, exist_ok=True)
+    gdir = game_dir_for(data_dir, game_id)
+    if gdir is None:
+        raise FileNotFoundError(
+            f"no split cache for {game_id} under {os.path.join(data_dir, 'cache')}")
+    out = os.path.join(out_dir, f"{game_id}.rpo")
+    info = opt_cache.export_game(Path(gdir), Path(out), level)
+    return out, info
+
+
+def do_import_rpo(rpo_path, data_dir, ppu_name=None):
+    """Unpack a .rpo into <data_dir>/cache/<gameId>/, matching each module to a
+    local ppu-* dir by name. data_dir is the dir that (or will) hold cache/.
+    Returns the unpack report."""
+    rpo_game_id(rpo_path)  # validate + surface a clear error on bad files
+    return opt_cache.unpack_game(Path(rpo_path), Path(data_dir), ppu_name)
 
 
 def select_game(games, game=None):
-    """Best game to export: the one with the most total entries
-    (ties broken by name). None when the game has no usable cache."""
+    """Best game to export: the one with the most total entries (ties by name)."""
     cands = {g: ts for g, ts in games.items()
              if sum(t["entries"] for t in ts) > 0
              and (game is None or g.lower() == game.lower())}
     if not cands:
         return None
     return max(cands, key=lambda g: (sum(t["entries"] for t in cands[g]), g))
-
-
-def do_export_game(data_dir, game_id, out_dir, mode="byte-exact"):
-    """Pack ALL non-empty modules of a game into <out_dir>/<GAMEID>.rsca (RSCA v2).
-    Returns the output path."""
-    os.makedirs(out_dir, exist_ok=True)
-    gdir = game_dir_for(data_dir, game_id)
-    if gdir is None:
-        raise FileNotFoundError(f"game dir not found for {game_id} under {os.path.join(data_dir, 'cache')}")
-    out = os.path.join(out_dir, f"{game_id}.rsca")
-    opt_cache.cmd_pack(types.SimpleNamespace(cache=gdir, out=out, game_id=game_id, mode=mode))
-    return out
 
 
 def _resolve_data(data_arg):
@@ -271,7 +241,7 @@ def _resolve_data(data_arg):
     data, trees = discover()
     if data is None:
         if sys.stdin.isatty():
-            print("No RPCS3 shader cache found automatically.")
+            print("No RPCS3 split shader cache found automatically.")
             p = input("Path to the RPCS3 data dir (containing cache/<GAMEID>/), or empty to abort: ").strip()
             if p:
                 data = os.path.abspath(p)
@@ -290,14 +260,15 @@ def _pick(prompt, n):
         print(f"enter a number 1..{n}")
 
 
+# --- game title (offline, from the local PARAM.SFO) ---
+PSF_MAGIC = 0x46535000  # "\0PSF" little-endian
+
+
 def _sfo_entry(data, key):
-    """Read one string entry from a PSF/SFO file (RPCS3-compatible layout:
-    header + 16-byte index entries + null-terminated key table + data region)."""
-    import struct
     if len(data) < 20:
         return None
     magic, _ver, off_keys, off_data, count = struct.unpack_from("<IIIII", data, 0)
-    if magic != 0x00004653 or off_keys > off_data or off_data > len(data):
+    if magic != PSF_MAGIC or off_keys > off_data or off_data > len(data):
         return None
     for i in range(count):
         e = 20 + i * 16
@@ -316,6 +287,14 @@ def _sfo_entry(data, key):
     return None
 
 
+def _sfo_title(data):
+    for k in ("TITLE", "NPTITLE", "TITLE_08", "TITLE_16"):
+        v = _sfo_entry(data, k)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
 def _ppu_label(ppu_dir):
     """'ppu-<hash>-GOWA.SELF' -> 'GOWA.SELF' (falls back to the full name)."""
     name = os.path.basename(ppu_dir)
@@ -323,34 +302,57 @@ def _ppu_label(ppu_dir):
     return parts[2] if len(parts) == 3 and parts[0] == "ppu" else name
 
 
+def _library_base_dirs(data_dir):
+    dirs = []
+
+    def add(p):
+        if p:
+            p = os.path.abspath(p)
+            if p not in dirs:
+                dirs.append(p)
+
+    if data_dir:
+        add(data_dir)
+    for c in candidate_data_dirs(os.path.expanduser("~"), dict(os.environ)):
+        add(c)
+    return dirs
+
+
 def _game_library_roots(data_dir):
-    """Where RPCS3 looks for game dirs — real VFS keys (rpcs3/Emu/vfs_config.h):
-    dev_hdd0 (PS3_GAME/...), dev_bdvd (mounted disc), games_dir — as configured in
-    config.yml (VFS section), else their defaults under the data dir; plus the
-    platform default library (C:/Games/PS3 or ~/Games/PS3)."""
     roots = []
-    cfg = os.path.join(data_dir, "config.yml")
-    if os.path.isfile(cfg):
-        try:
-            import re
-            with open(cfg, errors="replace") as f:
-                txt = f.read()
-            for key in ("dev_hdd0", "dev_hdd1", "dev_bdvd", "games_dir"):
-                m = re.search(rf"{key}\s*:\s*(\S+)", txt)
-                if m:
-                    p = m.group(1).strip("'\"")
-                    if p and p not in roots:
-                        roots.append(p)
-        except OSError:
-            pass
-    for key, sub in (("dev_hdd0", "PS3_GAME"), ("dev_bdvd", "PS3_GAME"),
-                     ("games_dir", None), ("dev_bdvd", None)):
-        # defaults live under the data dir when config.yml doesn't override them
-        d = os.path.join(data_dir, key) if key != "games_dir" else os.path.join(data_dir, "games")
-        if os.path.isdir(d):
-            r = os.path.join(d, sub) if sub else d
-            if r not in roots:
-                roots.append(r)
+
+    def add_root(r):
+        if r and r not in roots:
+            roots.append(r)
+
+    sub_by_key = {
+        "dev_hdd0": ("game", "PS3_GAME"),
+        "dev_hdd1": ("game", "PS3_GAME"),
+        "dev_bdvd": ("PS3_GAME",),
+        "games_dir": (None,),
+    }
+    for base in _library_base_dirs(data_dir):
+        cfg = os.path.join(base, "config.yml")
+        if os.path.isfile(cfg):
+            try:
+                import re
+                with open(cfg, errors="replace") as f:
+                    txt = f.read()
+                for key in ("dev_hdd0", "dev_hdd1", "dev_bdvd", "games_dir"):
+                    m = re.search(rf"{key}\s*:\s*(\S+)", txt)
+                    if m:
+                        vbase = m.group(1).strip("'\"")
+                        if not vbase:
+                            continue
+                        for sub in sub_by_key[key]:
+                            add_root(os.path.join(vbase, sub) if sub else vbase)
+            except OSError:
+                pass
+        for key in ("dev_hdd0", "dev_bdvd", "games_dir"):
+            d = os.path.join(base, "games") if key == "games_dir" else os.path.join(base, key)
+            if os.path.isdir(d):
+                for sub in sub_by_key[key]:
+                    add_root(os.path.join(d, sub) if sub else d)
     if os.name == "nt":
         roots.append(os.path.join("C:", "Games", "PS3"))
     else:
@@ -362,8 +364,6 @@ _TITLE_CACHE = {}
 
 
 def game_title(game_id, data_dir):
-    """Game display name (NPTITLE) from the LOCAL game's PARAM.SFO — offline,
-    no network. None when the game dir isn't found in the library paths."""
     key = game_id.upper()
     if key in _TITLE_CACHE:
         return _TITLE_CACHE[key]
@@ -375,7 +375,7 @@ def game_title(game_id, data_dir):
                 continue
             try:
                 with open(p, "rb") as f:
-                    t = _sfo_entry(f.read(), "NPTITLE")
+                    t = _sfo_title(f.read())
             except OSError:
                 t = None
             if t and t.strip():
@@ -388,27 +388,23 @@ def game_title(game_id, data_dir):
 
 
 def _game_head(game_id, data_dir):
-    """'God of War (BCES01741)' when the title is known locally, else 'BCES01741'."""
     t = game_title(game_id, data_dir) if data_dir else None
     return f"{t} ({game_id})" if t else game_id
 
 
 def _games_view(games, data_dir=None):
-    """'God of War (BCES01741)  (2 modules: GOWA.SELF 622, EBOOT.BIN 3)' style lines."""
     lines = []
     for g in sorted(games):
-        mods = [t for t in games[g] if t["entries"] > 0]
-        empty = len(games[g]) - len(mods)
+        mods = games[g]
         detail = ", ".join(f"{_ppu_label(t['ppu_dir'])} {t['entries']}" for t in mods)
-        suffix = f" (+{empty} empty)" if empty else ""
-        lines.append(f"  game {_game_head(g, data_dir)}  ({len(mods)} module(s): {detail or 'nothing playable yet'}{suffix})")
+        lines.append(f"  game {_game_head(g, data_dir)}  ({len(mods)} module(s): {detail or 'nothing playable yet'})")
     return lines
 
 
 def interactive():
     data, trees = discover()
     if data is None:
-        print("No RPCS3 shader cache found automatically.")
+        print("No RPCS3 split shader cache found automatically.")
         try:
             p = input("Path to the RPCS3 data dir (containing cache/<GAMEID>/), or empty to abort: ").strip()
         except EOFError:
@@ -422,39 +418,42 @@ def interactive():
     for line in _games_view(games, data):
         print(line)
     if not trees:
-        print("  (no shader caches yet — play a game first)")
+        print("  (no split shader caches yet — play a game in the fork first)")
     while True:
         print()
-        print("  [1] add a cache to RPCS3 (import a .rsca file)")
-        print("  [2] export a game (all its modules) to .rsca")
+        print("  [1] add a cache to RPCS3 (import a .rpo file)")
+        print("  [2] export a game (all its split modules) to .rpo")
         print("  [0] quit")
         try:
             c = input("> ").strip()
         except EOFError:
             return 1
         if c == "1":
-            rsca = list_rsca_files(PROGRAM_DIR)
-            if not rsca:
-                print(f"no .rsca files in {PROGRAM_DIR}")
+            rpos = list_rpo_files(PROGRAM_DIR)
+            if not rpos:
+                print(f"no .rpo files in {PROGRAM_DIR}")
                 continue
-            for i, f in enumerate(rsca, 1):
+            for i, f in enumerate(rpos, 1):
                 try:
-                    info = rsca_modules(os.path.join(PROGRAM_DIR, f))
-                    mods = ", ".join(f"{m['label']} {m['entries']}" for m in info["modules"])
-                    print(f"  [{i}] {f}  ({info['game_id']}, {len(info['modules'])} module(s): {mods})")
+                    info = rpo_info(os.path.join(PROGRAM_DIR, f))
+                    mods = ", ".join(f"{m['name'].split('-', 2)[-1]} {m.get('pipeline_count','?')}"
+                                     for m in info["modules"])
+                    print(f"  [{i}] {f}  ({info.get('gameId')}, {len(info['modules'])} module(s): {mods})")
                 except Exception:
                     print(f"  [{i}] {f}")
-            i = _pick("file: ", len(rsca))
-            f = rsca[i]
+            i = _pick("file: ", len(rpos))
+            f = rpos[i]
             try:
-                target = do_import(os.path.join(PROGRAM_DIR, f), data)
-                print(f"imported into: {target}")
-            except FileNotFoundError as e:
+                res = do_import_rpo(os.path.join(PROGRAM_DIR, f), data)
+                print(f"imported {res['gameId']} — {res['files']} files into {res['base']}")
+                for m in res["modules"]:
+                    print(f"  {m['name']}  ({m['files']} files)")
+            except (ValueError, FileNotFoundError) as e:
                 print(f"ERROR: {e}")
             return 0
         if c == "2":
             if not trees:
-                print("no shader caches to export")
+                print("no split shader caches to export")
                 continue
             playable = {g: ts for g, ts in games.items() if sum(t["entries"] for t in ts) > 0}
             if not playable:
@@ -467,7 +466,8 @@ def interactive():
             i = _pick("game: ", len(names))
             g = names[i]
             try:
-                do_export_game(data, g, PROGRAM_DIR)
+                out, info = do_export_game(data, g, PROGRAM_DIR)
+                print(f"exported {info['gameId']} — {info['module_count']} module(s) -> {out}")
             except FileNotFoundError as e:
                 print(f"ERROR: {e}")
             return 0
@@ -475,42 +475,72 @@ def interactive():
             return 0
 
 
+def _diag(data_dir, games):
+    roots = _game_library_roots(data_dir)
+    print(f"data dir : {data_dir}")
+    print("library roots searched:")
+    for r in roots:
+        print(f"  [{'ok' if os.path.isdir(r) else 'no'}] {r}")
+    print()
+    for g in sorted(games):
+        key = g.upper()
+        found = None
+        for root in roots:
+            for rel in (key, os.path.join(key, "BLURAY"), os.path.join(key, "PS3_GAME")):
+                p = os.path.join(root, rel, "PARAM.SFO")
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "rb") as f:
+                            t = _sfo_title(f.read())
+                    except OSError:
+                        t = None
+                    if t and t.strip():
+                        found = (p, t.strip())
+                        break
+            if found:
+                break
+        if found:
+            print(f"{g}: TITLE '{found[1]}'  <- {found[0]}")
+        else:
+            print(f"{g}: NOT FOUND (no readable PARAM.SFO)")
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Interactive RPCS3 shader-cache manager (RSCA v2).")
+    ap = argparse.ArgumentParser(description="Interactive RPCS3 FORK shader-cache manager (split format).")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("discover", help="print the auto-discovered data dir and games")
-    sub.add_parser("list", help="list cache games and .rsca files in the program folder")
-    p_in = sub.add_parser("import", help="add a .rsca file to the local RPCS3 cache")
+    p_d = sub.add_parser("discover", help="print the auto-discovered data dir and games")
+    p_d.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
+    p_l = sub.add_parser("list", help="list split cache games and .rpo files in the program folder")
+    p_l.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
+    p_in = sub.add_parser("import", help="add a .rpo file to the local RPCS3 cache")
     p_in.add_argument("file")
     p_in.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
-    p_in.add_argument("--ppu", help="merge into this exact ppu-* dir (default: auto-match per module)")
-    p_ex = sub.add_parser("export", help="pack a whole game (all non-empty modules) into <GAMEID>.rsca")
+    p_in.add_argument("--ppu", help="force a single ppu-* target name")
+    p_ex = sub.add_parser("export", help="pack a whole game (all split modules) into <GAMEID>.rpo")
     p_ex.add_argument("--data", help="RPCS3 data dir (default: auto-discover)")
     p_ex.add_argument("--game", help="game id, e.g. BCES01741 (default: game with most entries)")
-    p_ex.add_argument("--ppu", help="export only this exact ppu-* dir (overrides --game)")
     p_ex.add_argument("--out", default=PROGRAM_DIR, help="output dir (default: the program folder)")
+    p_ex.add_argument("--level", type=int, default=9, help="zstd level (1-22)")
     args = ap.parse_args(argv)
 
     if args.cmd is None:
         return interactive()
 
     if args.cmd == "discover":
-        data, trees = _resolve_data(None)
+        data, trees = _resolve_data(args.data)
         print(f"data dir : {data}")
-        games = group_games(trees)
-        for line in _games_view(games, data):
+        for line in _games_view(group_games(trees), data):
             print(line)
         return 0
 
     if args.cmd == "list":
-        data, trees = _resolve_data(None)
+        data, trees = _resolve_data(args.data)
         print(f"data dir : {data}")
-        games = group_games(trees)
-        for line in _games_view(games, data):
+        for line in _games_view(group_games(trees), data):
             print(line)
         print(f"program  : {PROGRAM_DIR}")
-        for f in list_rsca_files(PROGRAM_DIR):
-            print(f"  .rsca {f}")
+        for f in list_rpo_files(PROGRAM_DIR):
+            print(f"  .rpo {f}")
         return 0
 
     if args.cmd == "import":
@@ -524,31 +554,22 @@ def main(argv=None):
                 sys.stderr.write(f"ERROR: file not found: {args.file}\n")
                 return 2
         try:
-            target = do_import(f, data, args.ppu)
-        except FileNotFoundError as e:
+            res = do_import_rpo(f, data, args.ppu)
+        except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"ERROR: {e}\n")
             return 2
-        print(f"imported into: {target}")
+        print(f"imported {res['gameId']} — {res['files']} files into {res['base']}")
         return 0
 
     # export
     data, trees = _resolve_data(args.data)
-    os.makedirs(args.out, exist_ok=True)
-    if args.ppu:
-        ppu = os.path.abspath(args.ppu)
-        game = os.path.basename(os.path.dirname(ppu))
-        if game.lower() == "cache":
-            game = "UNKNOWN"
-        out = os.path.join(args.out, f"{game}.rsca")
-        opt_cache.cmd_pack(types.SimpleNamespace(cache=ppu, out=out, game_id=game, mode="byte-exact"))
-    else:
-        games = group_games(trees)
-        g = select_game(games, args.game)
-        if g is None:
-            sys.stderr.write("ERROR: no game with cached entries found.\n")
-            return 2
-        out = do_export_game(data, g, args.out)
-    print(f"exported    : {out}")
+    games = group_games(trees)
+    g = select_game(games, args.game)
+    if g is None:
+        sys.stderr.write("ERROR: no game with cached split entries found.\n")
+        return 2
+    out, info = do_export_game(data, g, args.out, args.level)
+    print(f"exported    : {out}  ({info['module_count']} module(s))")
     return 0
 
 
