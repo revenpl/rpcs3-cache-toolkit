@@ -71,6 +71,10 @@ def _make_rpo(root, data, game="BCES01741"):
 class Base(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="rpo_")
+        # .rpo files already in the program folder belong to the user —
+        # tearDown must never delete them (2026-10-22: the blanket cleanup
+        # wiped a real BCES01741.rpo that sat next to the scripts).
+        self._rpo_preserved = {f for f in os.listdir(HERE) if f.lower().endswith(".rpo")}
         self.data = os.path.join(self.root, "data")
         os.makedirs(self.data)
         _build(self.data)
@@ -94,7 +98,7 @@ class Base(unittest.TestCase):
             if not os.path.isdir(base):
                 continue
             for f in os.listdir(base):
-                if f.lower().endswith(".rpo"):
+                if f.lower().endswith(".rpo") and f not in getattr(self, "_rpo_preserved", set()):
                     try:
                         os.remove(os.path.join(base, f))
                     except OSError:
@@ -128,6 +132,47 @@ class TestDiscovery(Base):
         d = cache_tool.game_dir_for(self.data, "bcES01741")
         self.assertEqual(os.path.basename(d), "BCES01741")
         self.assertIsNone(cache_tool.game_dir_for(self.data, "BCES99999"))
+
+
+class TestWipedCacheDiscovery(Base):
+    """2026-10-22 incident: after the user deleted the live cache, discover()
+    fell through to a fixture tree elsewhere in $HOME (test trees under
+    ~/.hermes) and import unpacked into the wrong place. A genuine install
+    (RPCS3-specific artifacts) must win even when its cache is empty."""
+
+    def _home(self, with_install=True):
+        home = os.path.join(self.root, "home2")
+        if with_install:
+            install = os.path.join(home, ".cache", "rpcs3")
+            os.makedirs(os.path.join(install, "cache"))  # wiped cache dir
+            with open(os.path.join(install, "RPCS3.log"), "w") as f:
+                f.write("log\n")
+            os.makedirs(os.path.join(install, "ppu_progs"))
+        # fixture: a usable split cache elsewhere in $HOME
+        fx = os.path.join(home, ".hermes", "cache")
+        shutil.copytree(os.path.join(self.data, "cache", "BCES01277"),
+                        os.path.join(fx, "BCES01277"))
+        return home
+
+    def test_wiped_install_beats_fixture(self):
+        home = self._home(with_install=True)
+        env = dict(os.environ, HOME=home,
+                   XDG_CACHE_HOME=os.path.join(home, ".cache"),
+                   XDG_CONFIG_HOME=os.path.join(home, ".config"))
+        data, trees = cache_tool.discover(home=home, env=env)
+        self.assertIsNotNone(data)
+        self.assertEqual(os.path.basename(data), "rpcs3")
+        self.assertEqual(trees, [])
+
+    def test_fixture_still_found_without_install(self):
+        home = self._home(with_install=False)
+        env = dict(os.environ, HOME=home,
+                   XDG_CACHE_HOME=os.path.join(home, "nope"),
+                   XDG_CONFIG_HOME=os.path.join(home, "nope2"))
+        data, trees = cache_tool.discover(home=home, env=env)
+        self.assertIsNotNone(data)
+        self.assertTrue(trees)
+        self.assertEqual(os.path.basename(data), ".hermes")
 
 
 class TestExport(Base):

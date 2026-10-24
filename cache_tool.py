@@ -142,14 +142,33 @@ def search_hits(root, max_depth=5):
     return hits
 
 
+def _looks_like_rpc_install(d):
+    """True when dir carries RPCS3-specific artifacts — a genuine install
+    (cache dir with logs/ppu_progs, or config dir with config.yml/dev_hdd0),
+    possibly one whose shader cache is empty or was deleted."""
+    for m in ("config.yml", "dev_hdd0", "RPCS3.log", "RPCS3.log.gz",
+              "ppu_progs", "spu_progs", "shaderlog"):
+        if os.path.exists(os.path.join(d, m)):
+            return True
+    return False
+
+
 def discover(home=None, env=None):
     """-> (data_dir | None, [trees]). (None, []) when nothing found."""
     home = home or os.path.expanduser("~")
     env = dict(env) if env is not None else dict(os.environ)
+    real_install = None
     for cand in candidate_data_dirs(home, env):
         trees = find_shader_caches(cand)
         if trees:
             return cand, trees
+        if real_install is None and _looks_like_rpc_install(cand):
+            real_install = cand
+    # A genuine install whose cache is empty/deleted beats a random fixture
+    # hit elsewhere in $HOME (test trees & co.) — otherwise import would
+    # unpack into the wrong place (2026-10-22 incident: ~/.hermes).
+    if real_install is not None:
+        return real_install, []
     roots = [home]
     if os.name == "nt":
         roots += [os.path.join(env.get("ProgramFiles") or "C:/Program Files"),
